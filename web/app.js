@@ -3,6 +3,8 @@
 // (scripts/record_demo.py steps it at 30 fps and screenshots each frame), otherwise it is performance.now().
 import * as THREE from 'three';
 import { OrbitControls } from '/web/vendor/OrbitControls.js';
+import { GLTFLoader } from '/web/vendor/GLTFLoader.js';
+import { mergeGeometries } from '/web/vendor/BufferGeometryUtils.js';
 
 const $ = (s) => document.querySelector(s);
 const PARAMS = new URLSearchParams(location.search);
@@ -20,7 +22,8 @@ const ACCENT = 0xff8a3d, BAD = 0xff5a5f, OK = 0x3ddc97;
 const USE_COLOR = { living: 0x4c9aff, bedroom: 0x9b7bff, office: 0x3ddc97, study: 0x3ddc97, dining: 0x4c9aff,
   kitchen: 0xffc857, bathroom: 0x5ad1e6, store: 0x8a93a0, corridor: 0x8a93a0, workshop: 0xffc857, production: 0xffc857,
   storage: 0x8a93a0, warehouse: 0x8a93a0 };
-const SCAN_MS = 6000, CLOUD_TARGET_MS = 14000, CLOUD_HOLD_MS = 2800, BIM_MS = 11000;
+const SCAN_MS = 6000, CLOUD_TARGET_MS = 14000, CLOUD_HOLD_MS = 2800, BIM_MS = 11000, BIM_TAG_SHIFT = 4400, UNDERSTAND_MS = 16000, HERO_MS = 12500;
+let modelEditId = null;
 const CUT = 1.2, CUT_TALL = 2.2;               // design-stage cutaway heights: walls/openings, equipment/other
 const CUT_KINDS = new Set(['wall', 'door', 'window', 'column', 'opening']);
 
@@ -47,6 +50,7 @@ const world = new THREE.Group(); scene.add(world);        // BIM elements
 const overlay = new THREE.Group(); scene.add(overlay);    // egress paths etc.
 const NOCLIP = () => new THREE.Plane(new THREE.Vector3(0, 0, 1), 1e6);
 const wipePlane = NOCLIP();                                // model side of the scan|model compare wipe
+const meshCut = new THREE.Plane(new THREE.Vector3(0, 0, -1), 1e6);   // keeps z <= constant: design cutaway / hero assemble for meshes
 let cloud = null, cloudU = null, meta = null, frustum = null, pathLine = null;
 const sceneC = new THREE.Vector3(4, 3, 1); let sceneR = 9, ceiling = 2.9, cloudC = null, cloudR = null;
 
@@ -70,13 +74,18 @@ function shot(t) {          // camera for the current stage at stage time t (ms)
     return { target: C, az: -0.9 + (stage === 'cloud' ? s * 0.055 : 0), el: 0.92 - (stage === 'cloud' ? Math.min(s, 16) * 0.012 : 0), dist: fitDist(R) * (1.0 - (stage === 'cloud' ? Math.min(s, 16) * 0.006 : 0)) };
   }
   if (stage === 'bim') return { target: sceneC, az: camShot.az0 + s * 0.05, el: 0.8, dist: fitDist(sceneR) * 0.95 };
+  if (stage === 'understand') return { target: sceneC, az: camShot.az0 + s * 0.035, el: 0.88, dist: fitDist(sceneR) * 0.64 };
+  if (stage === 'replan') return { target: sceneC, az: camShot.az0 + s * 0.008, el: 1.02, dist: fitDist(sceneR) * 0.9 };
+  if ((stage === 'hero' && !heroCam) || ((stage === 'hero' || stage === 'modeledit') && !focusC)) return { target: camShot.t0, az: camShot.az0 + s * 0.02, el: camShot.el0, dist: camShot.d0 };
+  if (stage === 'hero' || stage === 'modeledit') return { target: focusC, az: camShot.az0 + s * (stage === 'hero' ? 0.2 : 0.12), el: stage === 'hero' ? 0.45 : 0.6, dist: focusD };
   // design: higher, slow drift, gentle push towards what the agent just touched
   const w = focus.w, tgt = sceneC.clone();
   if (focus.c && w > 0) tgt.lerp(focus.c, 0.4 * w);
   return { target: tgt, az: camShot.az0 + s * 0.012, el: 0.95, dist: fitDist(sceneR) * (0.98 - 0.12 * w) };
 }
 
-function camStage() { camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = clock(); camShot = { az0: cam.az }; manual = false; }
+function camStage() { camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = clock(); camShot = { az0: cam.az, t0: cam.target.clone(), el0: cam.el, d0: cam.dist, at: clock() }; manual = false; }
+let heroCam = false, focusC = null, focusD = 10, focusKey = null, held = false, autoKey = null;
 
 function updateCamera(now) {
   if (manual) { controls.update(); return; }
@@ -96,27 +105,46 @@ function updateCamera(now) {
 const CLOUD_VS = `
 #include <common>
 #include <clipping_planes_pars_vertex>
-uniform float uReveal, uLo, uFresh, uSize, uScale, uMinPx, uMaxPx; uniform vec3 uHi; uniform vec4 uWipe;
-varying vec3 vColor; varying float vSide;
+uniform float uReveal, uLo, uFresh, uSize, uScale, uMinPx, uMaxPx, uTint, uBgOp, uBgClip, uDim, uLift, uObjOp; uniform vec3 uHi; uniform vec4 uWipe;
+uniform sampler2D uObj;
+attribute float label;
+varying vec3 vColor; varying float vSide, vA;
+vec3 hue(float h) { return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }
 void main() {
   float id = float(gl_VertexID);
   if (id >= uReveal || id < uLo) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
-  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vec3 p = position; float hl = 0.0, hide = 0.0;
+  int li = int(label + 0.5);
+  if (li > 0) {           // per-object rigid move (origin -> current), highlight, dissolve
+    vec4 A = texelFetch(uObj, ivec2(0, li), 0), B = texelFetch(uObj, ivec2(1, li), 0);
+    float c = cos(B.x), s = sin(B.x); vec2 d = p.xy - A.xy;
+    p.xy = vec2(c * d.x - s * d.y, s * d.x + c * d.y) + A.zw; hl = B.y; hide = B.z;
+    p.z += uLift * hide * hide * (0.5 + fract(sin(id * 12.9898) * 43758.5453) * 1.5);
+  } else if (p.z > uBgClip) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  vA = li > 0 ? (1.0 - hide) * mix(uObjOp, 1.0, hl) : uBgOp;
+  vec4 wp = modelMatrix * vec4(p, 1.0);
   vec4 mvPosition = viewMatrix * wp;
   float fresh = 1.0 - smoothstep(0.0, 1.0, (uReveal - id) / max(uFresh, 1.0));
   vColor = mix(color, uHi, fresh * 0.8);
+  if (uTint > 0.0) {      // semantic tint: one hue per object, neutral grey for unlabelled points
+    vec3 seg = label > 0.5 ? mix(vec3(0.92), hue(fract(label * 0.618034 + 0.07)), 0.78) : vec3(0.22, 0.24, 0.27) + color * 0.12;
+    vColor = mix(vColor, seg, uTint);
+  }
+  vColor = mix(vColor, vColor * 0.2 + vec3(0.015), uDim * (1.0 - hl));
+  vColor = mix(vColor, min(vec3(1.0), mix(vColor, uHi, 0.35) * 1.35), hl);
   vSide = dot(uWipe.xyz, wp.xyz) + uWipe.w;
-  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6), uMinPx, uMaxPx);
+  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6 + hl * 0.35), uMinPx, uMaxPx);
   gl_Position = projectionMatrix * mvPosition;
   #include <clipping_planes_vertex>
 }`;
 const CLOUD_FS = `
 #include <clipping_planes_pars_fragment>
-uniform float uOpScan, uOpModel, uRound; varying vec3 vColor; varying float vSide;
+uniform float uOpScan, uOpModel, uRound; varying vec3 vColor; varying float vSide, vA;
 void main() {
   #include <clipping_planes_fragment>
   vec2 c = gl_PointCoord - 0.5; if (uRound > 0.5 && dot(c, c) > 0.25) discard;
-  gl_FragColor = vec4(vColor, vSide < 0.0 ? uOpScan : uOpModel);
+  float a = vSide < 0.0 ? uOpScan : uOpModel * vA; if (a < 0.01) discard;
+  gl_FragColor = vec4(vColor, a);
 }`;
 const clipCeiling = new THREE.Plane(new THREE.Vector3(0, 0, -1), 2.7);
 
@@ -130,7 +158,9 @@ async function loadCloud() {
   g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
   cloudU = { uReveal: { value: n }, uLo: { value: 0 }, uFresh: { value: n / Math.max(1, meta.frames) }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 },
     uScale: { value: 500 }, uHi: { value: new THREE.Color(1.0, 0.62, 0.32) }, uWipe: { value: new THREE.Vector4(0, 0, 0, 1) },
-    uOpScan: { value: 1 }, uOpModel: { value: 1 }, uMinPx: { value: 1.5 }, uMaxPx: { value: 64 }, uRound: { value: 1 } };
+    uOpScan: { value: 1 }, uOpModel: { value: 1 }, uMinPx: { value: 1.5 }, uMaxPx: { value: 64 }, uRound: { value: 1 }, uTint: { value: 0 },
+    uBgOp: { value: 1 }, uBgClip: { value: 1e6 }, uDim: { value: 0 }, uLift: { value: 0 }, uObjOp: { value: 1 }, uObj: { value: new THREE.DataTexture(new Float32Array(8), 2, 1, THREE.RGBAFormat, THREE.FloatType) } };
+  cloudU.uObj.value.needsUpdate = true;
   updateScale();
   cloud = new THREE.Points(g, new THREE.ShaderMaterial({ uniforms: cloudU, vertexShader: CLOUD_VS, fragmentShader: CLOUD_FS, vertexColors: true,
     transparent: true, depthWrite: true, clipping: true, clippingPlanes: [clipCeiling] }));
@@ -220,6 +250,22 @@ function buildElement(e) {
     g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), edgeMat(col, 0.95)));
     return { g, parts, fades: [[mat, 0.3]] };
   }
+  const geo = meshFor(e);
+  if (!geo && segObject(e)) { addParts(e, g, parts); return { g, parts, fades: [], seg: true }; }   // its points are the model
+  if (geo) {                // segmented scan mesh (object-local, Z up, origin on the floor) instead of the fitted box
+    const bb = geo.boundingBox, h = Math.max(0.05, bb.max.z - bb.min.z), bg = new THREE.Group();
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.78, metalness: 0.08, emissive: 0x000000,
+      side: THREE.DoubleSide, clippingPlanes: [wipePlane, meshCut] }));
+    mesh.position.z = -(bb.min.z + h / 2); mesh.userData.id = e.id; mesh.castShadow = mesh.receiveShadow = true; bg.add(mesh);
+    if ((geo.index ? geo.index.count : geo.attributes.position.count) < 60000) {
+      const ed = new THREE.LineSegments(geo.userData.edges ??= new THREE.EdgesGeometry(geo, 35), edgeMat(0x2b3038, 0.6));
+      ed.material.clippingPlanes = [wipePlane, meshCut]; ed.position.z = mesh.position.z; bg.add(ed);
+    }
+    g.add(bg);
+    parts.push({ bg, bottom: bb.min.z, h, z0: e.pose.pos[2], cut: null, hero: true });
+    addParts(e, g, parts);
+    return { g, parts, fades: [], hero: true };
+  }
   const cutH = CUT_KINDS.has(e.kind) ? CUT : CUT_TALL;
   for (const b of e.boxes ?? []) {
     const geo = new THREE.BoxGeometry(...b.s), bg = new THREE.Group();
@@ -230,6 +276,19 @@ function buildElement(e) {
     parts.push({ bg, bottom: b.c[2] - b.s[2] / 2, h: b.s[2], z0: e.pose.pos[2], cut: proposed || e.kind === 'slab' ? null : cutH });
   }
   return { g, parts, fades: [] };
+}
+
+function addParts(e, g, parts) {     // add_part add-ons: snapshot boxes carrying a part id
+  for (const b of e.boxes ?? []) {
+    if (!b.part) continue;
+    const geo = b.shape === 'cylinder' ? new THREE.CylinderGeometry(Math.min(b.s[0], b.s[1]) / 2, Math.min(b.s[0], b.s[1]) / 2, b.s[2], 28).rotateX(Math.PI / 2) : new THREE.BoxGeometry(...b.s);
+    const bg = new THREE.Group(); bg.position.set(b.c[0], b.c[1], b.c[2]);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: hex(b.color, ACCENT), roughness: 0.55, metalness: 0.1, emissive: hex(b.color, ACCENT), emissiveIntensity: 0.12, clippingPlanes: [wipePlane] }));
+    mesh.userData.id = e.id; mesh.userData.part = true; mesh.castShadow = mesh.receiveShadow = true; bg.add(mesh);
+    const ed = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), edgeMat(0xffffff, 0.5)); ed.userData.partEdge = true; bg.add(ed);
+    g.add(bg);
+    parts.push({ bg, bottom: b.c[2] - b.s[2] / 2, h: b.s[2], z0: e.pose.pos[2], cut: null, part: b.part, name: b.name, c: b.c, s: b.s });
+  }
 }
 
 function elementBox(e, box = new THREE.Box3()) {
@@ -266,13 +325,21 @@ function applyModel(model, { animate = false, stagger = 0, flag = [], flagColor 
     if (old) world.remove(old.group);
     const { g, parts, fades } = buildElement(e);
     const delay = animate && stagger ? (i++ / Math.max(1, fresh - 1)) * stagger : 0;
+    const built = { g, parts, fades };
     const rec = { group: g, parts, fades, key, el: e, born: animate ? now + delay : 0, pop: animate && e.provenance === 'proposed',
-      base: g.position.clone(), baseQ: g.quaternion.clone() };
+      base: g.position.clone(), baseQ: g.quaternion.clone(), hero: !!meshFor(e), seg: !meshFor(e) && segObject(e) };
+    if (old && animate) {           // same element rebuilt: only what is new animates (added parts pop in, the body stays)
+      const had = new Set(old.parts.filter((p) => p.part).map((p) => p.part));
+      rec.born = 0; for (const p of parts) if (p.part && !had.has(p.part)) { p.born = now; p.isNew = true; }
+      if (old.group.position.distanceTo(g.position) > 0.01 || old.group.quaternion.angleTo(g.quaternion) > 0.01) rec.slide = { from: old.group.position.clone(), fromQ: old.group.quaternion.clone(), t0: now };
+    }
     world.add(g); groups.set(e.id, rec);
     setFlag(rec, flag.includes(e.id) ? flagColor : null);
     updateElement(rec, now);
   }
-  for (const [id, rec] of groups) if (!seen.has(id)) { world.remove(rec.group); groups.delete(id); }
+  for (const [id, rec] of groups) if (!seen.has(id)) { world.remove(rec.group); groups.delete(id); sel.delete(id); }
+  sel.forEach((id) => groups.get(id) && setFlag(groups.get(id), 0xffffff));
+  syncObjects(model, !animate);
   $('#rev').textContent = model.revision ? 'R' + model.revision : '';
   buildLabels(model);
 }
@@ -283,8 +350,15 @@ function updateElement(r, now) {
   if (r.born) { k = clamp((now - r.born) / (r.pop ? 650 : 750)); if (now >= r.born + 2000) r.born = 0; }
   const rise = r.born ? (r.pop ? easeBack(k) : easeOut(k)) : 1;
   for (const [m, o] of r.fades) m.opacity = o * clamp(k);
+  if (r.slide) {        // moved element glides like its points
+    const k2 = ease((now - r.slide.t0) / MOVE_MS);
+    r.group.position.lerpVectors(r.slide.from, r.base, k2); r.group.quaternion.slerpQuaternions(r.slide.fromQ, r.baseQ, k2);
+    if (k2 >= 1) r.slide = null;
+  }
+  if (r.hero) r.group.visible = heroMeshOn || r.focus === true;
   for (const p of r.parts) {
     let h = p.h;
+    if (p.born) { const kp = clamp((now - p.born) / 600); h *= Math.max(0.001, easeBack(kp)); if (kp >= 1) p.born = 0; }
     if (p.cut != null && cutNow < 1e5) h = clamp(Math.max(cutNow, p.cut) - p.z0 - p.bottom, 0, p.h);
     h *= Math.max(0.001, rise);
     p.bg.visible = h > 0.002;
@@ -298,7 +372,7 @@ function setFlag(rec, color) {
     if (o.userData.ghost) return;
     if (o.isLineSegments) { o.material.color.setHex(color ?? (proposed ? ACCENT : eDef)); o.material.opacity = color ? 1 : (proposed ? 1 : eOp); }
     if (o.isMesh && o.material.emissive && rec.el.kind !== 'slab') {
-      o.material.emissive.setHex(color ?? (proposed ? ACCENT : 0)); o.material.emissiveIntensity = color === BAD ? 0.75 : color ? 0.45 : (proposed ? 0.2 : 0);
+      o.material.emissive.setHex(color ?? (proposed ? ACCENT : 0)); o.material.emissiveIntensity = color === BAD ? 0.75 : color === 0xffffff ? 0.16 : color ? 0.45 : (proposed ? 0.2 : 0);
     }
   });
 }
@@ -374,7 +448,7 @@ function side(S, live) {
 }
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then(poll);
-const TAGS = { scan: '01 Video', cloud: '02 Point cloud', bim: '03 BIM', design: '04 Agentic design' };
+const TAGS = { scan: 'Video', cloud: 'Point cloud', bim: 'BIM', understand: 'Objects', hero: '3D model', replan: 'Re-plan', modeledit: 'Model edit', design: 'Agentic design' };
 function caption(t) {
   $('#tag').textContent = TAGS[stage];
   const s = $('#caption span'); if (s.textContent === (t || '')) return;
@@ -384,7 +458,8 @@ let toastUntil = 0;
 function toast(t, ok = false) { $('#sent').textContent = t; $('#sent').className = ok ? 'ok' : ''; toastUntil = clock() + 2600; }
 
 // ---------------------------------------------------------------- stages + replay
-let S = null, stage = 'scan', queue = [], shown = 0, busyUntil = 0, anim = null, autoplay = false, stageAt = 0, selected = null;
+let S = null, stage = 'scan', queue = [], shown = 0, busyUntil = 0, anim = null, autoplay = false, stageAt = 0;
+const sel = new Set();
 let revealDoneAt = 0, liveAt = 0, cloudRate = 1, base = null, baseIdx = 0, evMs = 1100;
 const video = $('#video');
 const vdur = () => (isFinite(video.duration) && video.duration > 0 ? video.duration : meta ? meta.frames / meta.fps : 10);
@@ -399,14 +474,19 @@ const KIND_RANK = { slab: 0, wall: 1, column: 2, door: 3, window: 3, opening: 3,
 const count = (m) => Object.values(m.elements).reduce((a, e) => (a[e.kind] = (a[e.kind] ?? 0) + 1, a), {});
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : w.endsWith('h') ? 'es' : 's'}`;
 
-function setStage(s) {
+function setStage(s, opts = {}) {
   if (follow) exitFollow();
   stage = s; stageAt = clock(); document.body.dataset.stage = s;
-  const order = ['scan', 'cloud', 'bim', 'design'];
+  const order = ['scan', 'cloud', 'bim', 'understand', 'design'];
   document.querySelectorAll('#steps button[data-s]').forEach((b) => { b.classList.toggle('on', b.dataset.s === s); b.classList.toggle('done', order.indexOf(b.dataset.s) < order.indexOf(s)); });
   if (cloud) { cloud.visible = s !== 'scan'; frustum.visible = pathLine.visible = s === 'cloud'; }
-  world.visible = s === 'bim' || s === 'design'; overlay.visible = s === 'design'; $('#labels').style.display = s === 'design' ? '' : 'none';
-  anim = null; revealDoneAt = 0; liveAt = 0; cutNow = Infinity; wipePlane.copy(NOCLIP());
+  world.visible = ['bim', 'design', 'understand', 'hero', 'replan', 'modeledit'].includes(s); overlay.visible = s === 'design'; $('#labels').style.display = s === 'design' ? '' : 'none';
+  anim = null; revealDoneAt = 0; liveAt = 0; cutNow = Infinity; wipePlane.copy(NOCLIP()); meshCut.constant = 1e6;
+  resetTags(); setModelOpacity(1); held = false; heroCam = false; focusC = null; autoKey = null; hoverKey = null; highlight([]);
+  heroMeshOn = !['understand', 'hero', 'cloud', 'scan'].includes(s);
+  groups.forEach((r) => { r.group.visible = true; r.focus = false; });
+  objXf.forEach((X) => X && (X.hide = 0));
+  if (cloudU) { cloudU.uTint.value = cloudU.uDim.value = cloudU.uLift.value = 0; cloudU.uBgOp.value = cloudU.uObjOp.value = 1; cloudU.uBgClip.value = 1e6; }
   $('#stat').innerHTML = '';
   base = baseline();
   if (base) frameModel(base);
@@ -430,9 +510,41 @@ function setStage(s) {
       if (c.wall) bits.push(plural(c.wall, 'wall')); if (c.door) bits.push(plural(c.door, 'door')); if (c.window) bits.push(plural(c.window, 'window'));
       if (c.equipment) bits.push(`${c.equipment} equipment`); if (c.column) bits.push(plural(c.column, 'column'));
       caption('Point cloud → as-built model');
+      if (hasLabels()) tagMode = { kind: 'seq', t0: stageAt + 3900, step: 380, max: 7, heroes: 2, t1: stageAt + 8500 };
       $('#stat').innerHTML = bits.join(' · ') + (base.scan?.fit_p50_mm != null ? ` · fit <b>${base.scan.fit_p50_mm} mm</b> P50` : '');
     } else caption('No BIM yet — run fit_bim');
   }
+  if (['understand', 'hero', 'replan', 'modeledit'].includes(s)) { video.pause(); if (cloud) revealTo(1e9); }
+  if (s === 'understand') {
+    if (base) applyModel(base);
+    world.visible = false;
+    caption('The model understands the scan'); $('#stat').innerHTML = `<b>${OBJ?.objects?.length ?? 0}</b> objects segmented and identified`;
+  }
+  if (s === 'hero') {
+    if (base) applyModel(base);
+    const o = OBJ?.byKey.get(opts.key) ?? heroes()[0]; focusKey = o?.key ?? null;
+    groups.forEach((r) => { const mine = r.el.object_key === focusKey; r.group.visible = mine; r.focus = mine; });
+    if (o) { const w = objWorld(o); focusC = new THREE.Vector3(w.x, w.y, o.size[2] * 0.45); focusD = Math.max(3, fitDist(Math.hypot(...o.size) / 2) * 1.2); }
+    meshCut.constant = -1;
+    if (opts.clicked) stageAt -= 1000;
+    caption(o ? 'Click an object to see its model' : 'No hero object in this scan');
+  }
+  if (s === 'replan' || s === 'modeledit') {
+    const H = S?.history ?? [], act = s === 'replan' ? 'move_element' : 'add_part';
+    const i0 = H.findIndex((h) => h.action === act), start = i0 > 0 ? i0 - 1 : Math.max(0, baseIdx);
+    if (H[start]) applyModel(H[start].model); else if (base) applyModel(base);
+    queue = i0 > 0 ? H.slice(start + 1) : []; shown = H.length; held = !!opts.hold;
+    busyUntil = stageAt + 2000; pills(H[start]?.validation ?? null); S && (S._liveShown = null);
+    evMs = 1500;
+    if (s === 'modeledit') {
+      const fid = H[i0]?.focus?.[0] ?? Object.values(S?.model?.elements ?? {}).find((e) => (e.boxes ?? []).some((b) => b.part))?.id;
+      const r = groups.get(fid); focusKey = r?.el.object_key ?? null;
+      if (r) { const b = elementBox(r.el), c = b.getCenter(new THREE.Vector3()), z = b.getSize(new THREE.Vector3()); focusC = new THREE.Vector3(c.x, c.y, z.z * 0.45); focusD = Math.max(3.5, fitDist(Math.hypot(z.x, z.y, z.z) / 2) * 1.5); }
+      tagMode = { kind: 'parts', list: [] }; modelEditId = fid; cutNow = CUT;
+      caption(r ? `Edit the model · ${r.el.label || r.el.name}` : 'No model edits in this scenario');
+    } else caption(queue.length ? 'Re-plan the floor' : 'No moves in this scenario');
+  }
+  if (heroMeshOn) for (const o of heroes()) { const e = elementFor(o.key); if (e && meshFor(e) && objXf[o.index]) objXf[o.index].hide = 1; }   // the mesh stands in for its points
   if (s === 'design') {
     video.pause(); if (cloud) revealTo(1e9);
     if (base) applyModel(base);
@@ -463,15 +575,24 @@ function focusOn(ids) {
 }
 
 function stepReplay(now) {
-  if (stage !== 'design' || !S || now < busyUntil) return;
+  if (!['design', 'replan', 'modeledit'].includes(stage) || !S || now < busyUntil || held) return;
   if (anim) { anim = null; groups.forEach((r) => { r.group.position.copy(r.base); r.group.quaternion.copy(r.baseQ); }); }
   if (queue.length) {
     const ev = queue.shift();
     const failing = ev.action === 'validate' && ev.validation && !(ev.validation.code_ok && ev.validation.safety_ok && ev.validation.physics_ok !== false);
     applyModel(ev.model, { animate: true, flag: ev.focus ?? [], flagColor: failing ? BAD : ACCENT });
     pills(ev.validation); focusOn(ev.focus ?? []);
-    caption(ev.caption);
-    busyUntil = now + evMs + (ev.action === 'validate' ? 500 : 0);
+    let cap = ev.caption || '';
+    for (const id of ev.focus ?? []) { const e = ev.model.elements[id]; if (e?.label && e.name && cap.includes(e.name)) cap = cap.replace(e.name, e.label); }
+    caption(cap);
+    busyUntil = now + evMs + (ev.action === 'validate' ? 500 : 0) + (ev.action === 'move_element' ? MOVE_MS : 0);
+    if (stage === 'modeledit' && tagMode?.kind === 'parts') {       // name each new part as it appears
+      const r = groups.get(modelEditId);
+      for (const p of r?.parts ?? []) if (p.isNew && !tagMode.list.some((q) => q.key === p.part)) {
+        p.isNew = false; r.group.updateMatrixWorld(true);
+        tagMode.list.push({ key: p.part, label: p.name, v: new THREE.Vector3(p.c[0], p.c[1], p.c[2] + p.s[2] / 2).applyMatrix4(r.group.matrixWorld), t: now + 250, prio: 1 });
+      }
+    }
     if (ev.animation?.frames?.length) {
       const names = movedNames(ev.animation);
       if (names.length) caption(`MuJoCo stability test · ${names.slice(0, 2).join(', ')} ${names.length > 1 ? 'fall' : 'falls'}`);
@@ -486,7 +607,7 @@ function stepReplay(now) {
     S._liveShown = S.seq;
     const bad = (S.validation?.issues ?? []).filter((i) => i.severity === 'fail' && i.element).map((i) => i.element);
     applyModel(S.model, { animate: true, flag: bad, flagColor: BAD });
-    pills(S.validation); side(S, true); drawEgress(S.validation);
+    pills(S.validation); if (stage === 'design') { side(S, true); drawEgress(S.validation); }
     if (first) { caption(S.agent_note || liveSummary(S.validation) || S.history.at(-1)?.caption || ''); focus.goal = 0; liveAt = now; }
   }
 }
@@ -497,7 +618,7 @@ async function poll() {
     if (r.status !== 200) return;
     const prev = S; S = await r.json();
     if (prev) S._liveShown = prev._liveShown;
-    if (stage === 'design') {
+    if (['design', 'replan', 'modeledit'].includes(stage)) {
       if (S.history.length > shown) { queue.push(...S.history.slice(shown)); S._liveShown = null; liveAt = 0; }
       else if (S.history.length < shown) { queue = []; groups.forEach((g) => world.remove(g.group)); groups.clear(); S._liveShown = null; }
       shown = S.history.length; side(S, !queue.length);
@@ -515,9 +636,13 @@ function status() {
   const t = clock() - stageAt;
   const done = stage === 'scan' ? t >= SCAN_MS
     : stage === 'cloud' ? (!meta ? t > 3000 : revealDoneAt > 0 && clock() - revealDoneAt >= CLOUD_HOLD_MS)
-    : stage === 'bim' ? t >= BIM_MS
+    : stage === 'bim' ? t >= BIM_MS + (hasLabels() ? BIM_TAG_SHIFT : 0)
+    : stage === 'understand' ? t >= UNDERSTAND_MS
+    : stage === 'hero' ? t >= HERO_MS
+    : stage === 'replan' || stage === 'modeledit' ? !held && !queue.length && liveAt > 0 && clock() - liveAt >= 2500
     : (liveAt > 0 && clock() - liveAt >= 2500) || (!S?.history?.length && t > 3000);
-  return { stage, t, done, queue: queue.length, question: !!S?.questions?.find((q) => q.answer == null) };
+  return { stage, t, done, queue: queue.length, question: !!S?.questions?.find((q) => q.answer == null), hoverKey, focusKey, held, seg: SEG,
+    heroes: heroes().map((o) => o.key), objects: OBJ?.objects?.length ?? 0 };
 }
 
 // ---------------------------------------------------------------- per-stage animation
@@ -549,29 +674,80 @@ function animateStage(now) {
     cloudU.uOpModel.value = cloudU.uOpScan.value = 1;
   }
   if (stage === 'bim') {
-    if (cloudU) { cloudU.uOpModel.value = 1 - 0.8 * ease(span(t, 900, 3800)); cloudU.uOpScan.value = 1; cloudU.uReveal.value = meta.n; cloudU.uFresh.value = 1; }
+    if (cloudU) {          // segmented: the objects' points stay, the shell's points give way to walls and slab
+      const f = ease(span(t, 900, 3800));
+      if (SEG) { cloudU.uOpModel.value = 1; cloudU.uBgOp.value = 1 - 0.85 * f; } else cloudU.uOpModel.value = 1 - 0.8 * f;
+      cloudU.uOpScan.value = 1; cloudU.uReveal.value = meta.n; cloudU.uFresh.value = 1;
+    }
     // compare wipe: sweep in from the left, rock, then hand the frame back to the model
     let w = null;
+    const t0 = t; { const t = t0 - (hasLabels() ? BIM_TAG_SHIFT : 0);
     if (t > 4600 && t < 10200) {
       w = t < 6200 ? -1.05 + 1.4 * ease(span(t, 4600, 6200)) : t < 7800 ? 0.35 - 0.7 * ease(span(t, 6200, 7800)) : t < 8800 ? -0.35 + 0.35 * ease(span(t, 7800, 8800)) : -1.05 * ease(span(t, 9200, 10200));
       if (t > 6000 && t < 6100) caption('Scan vs. rebuilt model');
-    }
+    } }
     setWipe(w);
   } else setWipe(null);
+  if (stage === 'understand' && cloudU) {   // hover beats (autopilot unless a person is pointing), then every segment tinted
+    cloudU.uReveal.value = meta.n; cloudU.uLo.value = 0; cloudU.uFresh.value = 1; cloudU.uOpModel.value = cloudU.uOpScan.value = 1;
+    if (now - pointerAt > 2500) {
+      const slot = Math.floor((t - 1200) / 2700), inSlot = (t - 1200) % 2700 < 2300 && slot >= 0 && slot < 4;
+      if (inSlot && (autoKey == null || autoKey.slot !== slot)) {
+        const pick = rankObjects().filter((o) => !autoKey?.used?.includes(o.key) && objectScreen(o.key)?.ok)[0];
+        autoKey = { slot, key: pick?.key ?? null, used: [...(autoKey?.used ?? []), pick?.key] };
+      }
+      setHover(inSlot ? autoKey?.key ?? null : null);
+    }
+    const tint = ease(span(t, 12000, 13000));
+    cloudU.uTint.value = tint;
+    cloudU.uDim.value += ((hoverKey && tint === 0 ? 1 : 0) - cloudU.uDim.value) * 0.2;
+    if (tint > 0) { setHover(null); caption(`Segmented into ${OBJ?.objects?.length ?? 0} objects`); }
+    else if (hoverKey) caption('Hover an object: all of its points, and what it is');
+  }
+  if (stage === 'hero' && cloudU) {
+    const o = OBJ?.byKey.get(focusKey);
+    cloudU.uReveal.value = meta.n; cloudU.uLo.value = 0; cloudU.uFresh.value = 1; cloudU.uOpModel.value = cloudU.uOpScan.value = 1; cloudU.uLift.value = 1;
+    if (o) {
+      objXf[o.index].hide = ease(span(t, 1200, 2800));
+      highlight(t < 1200 && t > 300 ? [o.key] : []);
+      const f = ease(span(t, 1100, 2400));
+      cloudU.uDim.value = 0.85 * f; cloudU.uBgOp.value = 1 - 0.7 * f; cloudU.uObjOp.value = 1 - 0.7 * f;
+      meshCut.constant = o.size[2] * 1.08 * ease(span(t, 1700, 3600)) - 0.01;
+      if (!heroCam && t > 1100) { heroCam = true; camStage(); }
+      if (t > 1200) caption(o.label);
+      if (t > 3600 && tagMode?.kind !== 'hero') {
+        const m = (x) => (Math.round(x * 10) / 10).toFixed(1);
+        tagMode = { kind: 'hero', key: o.key, t0: 0, props: `<span>${m(o.size[0])} × ${m(o.size[1])} × ${m(o.size[2])} m</span><span>${esc(o.category ?? 'object')}</span>` +
+          (o.confidence != null ? `<span>${Math.round(o.confidence * 100)}% confidence</span>` : '') + `<span>${fmt(o.points ?? 0)} points</span>` };
+      }
+    }
+  }
+  if ((stage === 'replan' || stage === 'modeledit') && cloudU) {
+    cloudU.uReveal.value = meta.n; cloudU.uLo.value = 0; cloudU.uFresh.value = 1; cloudU.uOpModel.value = cloudU.uOpScan.value = 1;
+    cloudU.uBgOp.value = stage === 'replan' ? 0.35 : 0.2; cloudU.uBgClip.value = stage === 'replan' ? CUT + 0.6 : CUT; cloudU.uObjOp.value = stage === 'replan' ? 1 : 0.3;
+    clipCeiling.constant = 1e6;
+  }
   if (stage === 'design') {
     const k = ease(span(t, 200, 1600));
     cutNow = k >= 1 ? CUT : (ceiling + 0.5) + (CUT - ceiling - 0.5) * k;
-    clipCeiling.constant = Math.max(cutNow, 0.3) + 0.02;
-    if (cloudU) { cloudU.uOpModel.value = 1 - 0.85 * ease(span(t, 0, 1200)); cloudU.uFresh.value = 1; }
+    meshCut.constant = Math.max(cutNow, CUT_TALL);
+    if (cloudU && SEG) {   // segmented: machines stay as points, the shell's points drop below the cut
+      clipCeiling.constant = 1e6; cloudU.uBgClip.value = Math.max(cutNow, 0.3); cloudU.uOpModel.value = 1; cloudU.uBgOp.value = 1 - 0.75 * ease(span(t, 0, 1200)); cloudU.uFresh.value = 1;
+    } else {
+      clipCeiling.constant = Math.max(cutNow, 0.3) + 0.02;
+      if (cloudU) { cloudU.uOpModel.value = 1 - 0.85 * ease(span(t, 0, 1200)); cloudU.uFresh.value = 1; }
+    }
     focus.w += (focus.goal - focus.w) * 0.03;
     updateEgress(now);
-  } else if (stage !== 'scan') clipCeiling.constant = ceiling - 0.2;
+  } else if (stage !== 'scan' && stage !== 'replan' && stage !== 'modeledit') clipCeiling.constant = ceiling - 0.2;
+  updateObjects(now);
   for (const r of groups.values()) updateElement(r, now);
   if (anim && now >= anim.t0) {
     const f = anim.frames[Math.min(anim.frames.length - 1, Math.floor((now - anim.t0) / 1000 * anim.fps))];
     for (const [id, p] of Object.entries(f)) { const r = groups.get(id); if (r) { r.group.position.set(p[0], p[1], p[2]); r.group.quaternion.set(p[4], p[5], p[6], p[3]); } }
   }
-  if (toastUntil && now > toastUntil) { toastUntil = 0; $('#sent').textContent = selected ? 'Selected: ' + groups.get(selected)?.el.name : ''; $('#sent').className = ''; }
+  if (toastUntil && now > toastUntil) { toastUntil = 0; $('#sent').textContent = ''; $('#sent').className = ''; }
+  updateTags(now);
 }
 
 // ---------------------------------------------------------------- interaction
@@ -579,20 +755,282 @@ document.querySelectorAll('#steps button[data-s]').forEach((b) => (b.onclick = (
 $('#play').onclick = () => { autoplay = true; setStage('scan'); };
 $('#say form').onsubmit = (ev) => {
   ev.preventDefault(); const i = $('#say input'); if (!i.value.trim()) return;
-  post('/api/message', { text: i.value.trim(), selected }); i.value = ''; toast('Sent to the agent ✓', true); i.blur();
+  if (!window.__demo?.dry) post('/api/message', { text: i.value.trim(), selected: [...sel] }); i.value = ''; toast('Sent to the agent ✓', true); i.blur();
 };
 const ray = new THREE.Raycaster(); let down = null;
 renderer.domElement.addEventListener('pointerdown', (e) => (down = [e.clientX, e.clientY]));
 renderer.domElement.addEventListener('pointerup', (e) => {
-  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4 || stage !== 'design') return;
-  ray.setFromCamera(new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1), camera);
-  const hit = ray.intersectObjects(world.children, true).find((h) => h.object.userData.id && groups.get(h.object.userData.id)?.el.kind !== 'slab');
-  if (selected && groups.get(selected)) setFlag(groups.get(selected), null);
-  selected = hit ? hit.object.userData.id : null;
-  if (selected) setFlag(groups.get(selected), 0xffffff);
-  $('#sent').textContent = selected ? 'Selected: ' + groups.get(selected).el.name : '';
+  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4 || follow || !['bim', 'understand', 'design', 'replan', 'modeledit'].includes(stage)) return;
+  const nx = (e.clientX / innerWidth) * 2 - 1, ny = -(e.clientY / innerHeight) * 2 + 1;
+  const key = SEG ? pickObject(nx, ny) : null;
+  if (key && OBJ.byKey.get(key)?.hero && MESHES.has(OBJ.byKey.get(key).mesh) && !e.shiftKey && (stage === 'bim' || stage === 'understand')) { setStage('hero', { key, clicked: true }); return; }
+  let id = key ? elementFor(key)?.id ?? null : null;
+  if (!id) {
+    ray.setFromCamera(new THREE.Vector2(nx, ny), camera);
+    const hit = ray.intersectObjects(world.children, true).find((h) => h.object.userData.id && !h.object.userData.ghost && groups.get(h.object.userData.id)?.el.kind !== 'slab' && h.object.visible);
+    id = hit?.object.userData.id ?? null;
+  }
+  if (!e.shiftKey) for (const k of [...sel]) if (k !== id) { sel.delete(k); groups.get(k) && setFlag(groups.get(k), null); }
+  if (id) { if (e.shiftKey && sel.has(id)) { sel.delete(id); setFlag(groups.get(id), null); } else { sel.add(id); setFlag(groups.get(id), 0xffffff); } }
+  highlight([...sel].map((i) => groups.get(i)?.el.object_key).filter(Boolean));
+  renderChips();
 });
+function renderChips() {      // selected elements travel with the next message
+  $('#chips').innerHTML = [...sel].map((id) => `<span class="chip" data-id="${id}">@${esc(groups.get(id)?.el.label || groups.get(id)?.el.name || id)}<b>×</b></span>`).join('');
+  $('#chips').querySelectorAll('.chip b').forEach((b) => (b.onclick = () => { const id = b.parentNode.dataset.id; sel.delete(id); groups.get(id) && setFlag(groups.get(id), null); renderChips(); }));
+}
+$('#steps button[data-s="understand"]').hidden = true; $('#steps .sep-u').hidden = true;
 
+
+// ---------------------------------------------------------------- segmented objects: labels per point, hero meshes, rigid moves
+// objects.json (all objects: label/function/pos/size/yaw), cloud_labels.bin (uint16 per point, k = objects[k-1]),
+// objects.glb (hero meshes only, object-local, stored glTF Y-up). Every piece is optional.
+let OBJ = null, SEG = false;
+const MESHES = new Map();                       // mesh name -> BufferGeometry (Z-up, object-local, origin on the floor)
+const objXf = [];                               // per label index: { o, from, to, t0, hl, hlFrom, hlTo, hlT0, hide }
+let objTex = null;
+const boxesMode = PARAMS.get('boxes') === '1';
+let heroMeshOn = true;
+const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+
+async function loadObjects() {
+  try { const r = await fetch('/data/scan/objects.json'); if (r.ok) OBJ = await r.json(); } catch { OBJ = null; }
+  if (!OBJ?.objects?.length) { OBJ = null; return; }
+  OBJ.byKey = new Map(OBJ.objects.map((o, i) => [o.key, { ...o, index: o.index ?? i + 1 }]));
+  if (OBJ.objects.some((o) => o.mesh)) {
+    try {
+      const gltf = await new GLTFLoader().loadAsync('/data/scan/objects.glb');
+      gltf.scene.updateMatrixWorld(true);
+      const yup = String(OBJ.glb_up ?? 'Y').toUpperCase() === 'Y', lists = new Map();
+      gltf.scene.traverse((o) => {
+        if (!o.isMesh) return;
+        const g = o.geometry.clone(); g.applyMatrix4(o.matrixWorld); if (yup) g.rotateX(Math.PI / 2);
+        const c = g.attributes.color;
+        if (c && OBJ.vertex_colors !== 'linear') {   // most exporters write sRGB bytes; three expects linear vertex colours
+          const a = new Float32Array(c.count * 3);
+          for (let i = 0; i < c.count; i++) { a[i * 3] = toLinear(c.getX(i)); a[i * 3 + 1] = toLinear(c.getY(i)); a[i * 3 + 2] = toLinear(c.getZ(i)); }
+          g.setAttribute('color', new THREE.BufferAttribute(a, 3));
+        }
+        g.userData.map = o.material?.map ?? null;
+        const name = o.name || o.parent?.name;
+        for (const n of new Set([name, o.parent?.name, o.geometry.name].filter(Boolean))) { if (!lists.has(n)) lists.set(n, []); lists.get(n).push(g); }
+      });
+      for (const [n, gs] of lists) {
+        let g = gs[0];
+        if (gs.length > 1) { try { g = mergeGeometries(gs.map((x) => x.index ? x.toNonIndexed() : x)) ?? gs[0]; g.userData.map = gs[0].userData.map; } catch { /* keep first */ } }
+        if (!g.attributes.normal) g.computeVertexNormals();
+        g.computeBoundingBox(); MESHES.set(n, g);
+      }
+    } catch (e) { console.warn('objects.glb not loaded', e); }
+  }
+  const N = Math.max(0, ...[...OBJ.byKey.values()].map((o) => o.index));
+  objTex = new THREE.DataTexture(new Float32Array(2 * (N + 1) * 4), 2, N + 1, THREE.RGBAFormat, THREE.FloatType);
+  objTex.needsUpdate = true;
+  for (const o of OBJ.byKey.values()) {
+    const id = { x: o.pos[0], y: o.pos[1], yaw: 0 };
+    objXf[o.index] = { o, from: id, to: id, cur: { ...id }, t0: 0, hl: 0, hlFrom: 0, hlTo: 0, hlT0: 0, hide: 0 };
+  }
+  if (cloud) {
+    cloudU.uObj.value = objTex;
+    try {
+      const r = await fetch('/data/scan/cloud_labels.bin?v=' + meta.n);
+      if (r.ok) { const b = await r.arrayBuffer(); if (b.byteLength >= meta.n * 2) { cloud.geometry.setAttribute('label', new THREE.BufferAttribute(new Uint16Array(b, 0, meta.n), 1)); SEG = true; } }
+    } catch { /* no labels */ }
+  }
+  $('#steps button[data-s="understand"]').hidden = !SEG;
+  $('#steps .sep-u').hidden = !SEG;
+}
+
+function meshFor(e) {
+  if (!OBJ || e.provenance === 'proposed' || boxesMode) return null;
+  const name = e.mesh ?? OBJ.byKey.get(e.object_key)?.mesh;
+  return name ? MESHES.get(name) ?? null : null;
+}
+const segObject = (e) => SEG && !boxesMode && e.provenance !== 'proposed' && e.object_key && OBJ?.byKey.has(e.object_key);
+const hasLabels = () => !!OBJ || [...groups.values()].some((r) => r.el.label);
+
+function syncObjects(model, instant = false) {     // rigid transform origin -> current pose for every object's points
+  if (!OBJ) return;
+  const now = clock(), seen = new Set();
+  for (const e of Object.values(model?.elements ?? {})) {
+    const o = e.object_key && OBJ.byKey.get(e.object_key); if (!o) continue;
+    const X = objXf[o.index]; seen.add(o.index);
+    const og = e.origin ?? { pos: o.pos, yaw_deg: o.yaw_deg };
+    const to = { x: e.pose.pos[0], y: e.pose.pos[1], yaw: e.pose.yaw - THREE.MathUtils.degToRad(og.yaw_deg ?? 0), ox: og.pos[0], oy: og.pos[1] };
+    setXf(X, to, instant, now);
+  }
+  for (const o of OBJ.byKey.values()) if (!seen.has(o.index)) setXf(objXf[o.index], { x: o.pos[0], y: o.pos[1], yaw: 0, ox: o.pos[0], oy: o.pos[1] }, instant || !model, now);
+}
+function setXf(X, to, instant, now) {
+  to.ox ??= X.o.pos[0]; to.oy ??= X.o.pos[1];
+  const same = Math.abs(to.x - X.to.x) + Math.abs(to.y - X.to.y) + Math.abs(to.yaw - X.to.yaw) < 1e-4;
+  if (same && !instant) return;
+  X.from = instant ? to : { ...X.cur, ox: X.cur.ox ?? to.ox, oy: X.cur.oy ?? to.oy }; X.to = to; X.t0 = now;
+  if (instant) X.cur = { ...to };
+}
+const MOVE_MS = 1700;
+function updateObjects(now) {
+  if (!objTex) return;
+  const d = objTex.image.data;
+  for (let i = 1; i < objXf.length; i++) {
+    const X = objXf[i]; if (!X) continue;
+    const k = ease((now - X.t0) / MOVE_MS), f = X.from, t = X.to;
+    X.cur = { x: f.x + (t.x - f.x) * k, y: f.y + (t.y - f.y) * k, yaw: f.yaw + (t.yaw - f.yaw) * k, ox: t.ox, oy: t.oy };
+    X.hl = X.hlFrom + (X.hlTo - X.hlFrom) * ease((now - X.hlT0) / 280);
+    d.set([X.cur.ox, X.cur.oy, X.cur.x, X.cur.y], i * 8);
+    d.set([X.cur.yaw, X.hl, X.hide, 0], i * 8 + 4);
+  }
+  objTex.needsUpdate = true;
+}
+function highlight(keys, now = clock()) {        // light up these objects' points (eased); others go back
+  const want = new Set(keys);
+  for (let i = 1; i < objXf.length; i++) {
+    const X = objXf[i]; if (!X) continue;
+    const to = want.has(X.o.key) ? 1 : 0;
+    if (X.hlTo !== to) { X.hlFrom = X.hl; X.hlTo = to; X.hlT0 = now; }
+  }
+}
+function objWorld(o) {      // current world placement of an object (follows moves)
+  const X = objXf[o.index], c = X?.cur ?? { x: o.pos[0], y: o.pos[1], yaw: 0 };
+  return { x: c.x, y: c.y, yaw: THREE.MathUtils.degToRad(o.yaw_deg ?? 0) + (c.yaw ?? 0) };
+}
+
+const _inv = new THREE.Matrix4(), _m = new THREE.Matrix4(), _r = new THREE.Ray(), _bx = new THREE.Box3(), _hit = new THREE.Vector3();
+function pickObject(ndcX, ndcY) {     // ray vs each object's oriented box -> nearest key
+  if (!OBJ) return null;
+  ray.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+  let best = null, bd = Infinity;
+  for (const o of OBJ.byKey.values()) {
+    const w = objWorld(o);
+    _m.makeRotationZ(w.yaw).setPosition(w.x, w.y, 0); _inv.copy(_m).invert();
+    _r.copy(ray.ray).applyMatrix4(_inv);
+    _bx.min.set(-o.size[0] / 2, -o.size[1] / 2, 0); _bx.max.set(o.size[0] / 2, o.size[1] / 2, o.size[2]);
+    if (_r.intersectBox(_bx, _hit)) { const d = _hit.applyMatrix4(_m).distanceTo(camera.position); if (d < bd) { bd = d; best = o.key; } }
+  }
+  return best;
+}
+function objectScreen(key) {
+  const o = OBJ?.byKey.get(key); if (!o) return null;
+  const w = objWorld(o); v3.set(w.x, w.y, o.size[2] * 0.55).project(camera);
+  return { x: (v3.x + 1) / 2 * innerWidth, y: (1 - v3.y) / 2 * innerHeight, ok: v3.z < 1 && Math.abs(v3.x) < 0.95 && Math.abs(v3.y) < 0.95 };
+}
+const elementFor = (key) => [...groups.values()].find((r) => r.el.object_key === key)?.el;
+const heroes = () => (OBJ ? [...OBJ.byKey.values()].filter((o) => o.hero && o.mesh && MESHES.has(o.mesh)) : []);
+const rankObjects = () => (OBJ ? [...OBJ.byKey.values()].sort((a, b) => (b.hero ? 1 : 0) - (a.hero ? 1 : 0) || b.size[0] * b.size[1] * b.size[2] * (0.5 + (b.confidence ?? 0.5)) - a.size[0] * a.size[1] * a.size[2] * (0.5 + (a.confidence ?? 0.5))) : []);
+
+// ---------------------------------------------------------------- labels: leader line + pill, choreographed per stage
+const tags = new Map();         // key -> { d, on, tOn, tOff, stem, sx, sy, side }
+let tagMode = null;             // { kind: 'seq'|'hover'|'follow'|'hero'|'parts', ... }
+function resetTags() { tags.forEach((t) => t.d.remove()); tags.clear(); tagMode = null; }
+
+function anchorsMap() {
+  const out = new Map();
+  if (OBJ) for (const o of OBJ.byKey.values()) {
+    const w = objWorld(o);
+    out.set(o.key, { key: o.key, label: o.label, fn: o.function, conf: o.confidence, cat: o.category, size: o.size, hero: !!o.hero,
+      v: new THREE.Vector3(w.x, w.y, o.size[2]), prio: o.size[0] * o.size[1] * o.size[2] * (0.5 + (o.confidence ?? 0.5)) + (o.hero ? 1e3 : 0) });
+  }
+  if (world.visible) for (const r of groups.values()) {
+    const e = r.el; if (!e.label || e.provenance === 'proposed') continue;
+    const k = e.object_key ?? e.id, b = elementBox(e), c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
+    const prev = out.get(k);
+    out.set(k, { ...(prev ?? {}), key: k, label: e.label, fn: e.function ?? prev?.fn, conf: e.confidence ?? prev?.conf, size: prev?.size ?? [s.x, s.y, s.z],
+      v: prev ? prev.v : new THREE.Vector3(c.x, c.y, b.max.z), prio: prev?.prio ?? s.x * s.y * s.z });
+  }
+  return out;
+}
+function tagEl(a) {
+  let t = tags.get(a.key);
+  if (!t) {
+    const d = document.createElement('div'); d.className = 'tag';
+    d.innerHTML = `<i></i><b></b><div class="tp"><span></span><small></small><em></em></div>`;
+    $('#tags').appendChild(d); t = { d, on: false, tOn: -1e9, tOff: -1e9, stem: 56, sx: 0, sy: 0 }; tags.set(a.key, t);
+  }
+  return t;
+}
+function tagContent(t, a, hero, props) {
+  const sig = a.label + '|' + (hero ? a.fn : '') + '|' + (props ?? '');
+  if (t.sig === sig) return; t.sig = sig;
+  t.d.querySelector('span').textContent = a.label;
+  t.d.querySelector('small').textContent = hero && a.fn ? a.fn : '';
+  t.d.querySelector('em').innerHTML = props ?? '';
+  t.d.classList.toggle('hero', !!(hero && a.fn)); t.d.classList.toggle('props', !!props);
+  t.w = null;
+}
+let followHero = null;
+function updateTags(T) {
+  const layer = $('#tags');
+  if (!tagMode) { layer.style.display = 'none'; return; }
+  layer.style.display = '';
+  const A = anchorsMap(), W = innerWidth, H = innerHeight;
+  const proj = (v) => { v3.copy(v).project(camera); return { x: (v3.x + 1) / 2 * W, y: (1 - v3.y) / 2 * H, ok: v3.z < 1 && Math.abs(v3.x) < 0.9 && Math.abs(v3.y) < 0.9 }; };
+  let want = [];
+  const m = tagMode;
+  if (m.kind === 'seq') {
+    if (!m.set && T >= m.t0) m.set = [...A.values()].filter((a) => proj(a.v).ok).sort((a, b) => b.prio - a.prio).slice(0, m.max).map((a) => a.key);
+    const n = Math.floor((T - m.t0) / m.step) + 1;
+    if (m.set && T < m.t1) want = m.set.slice(0, Math.max(0, n)).map((k, i) => ({ a: A.get(k), hero: i < m.heroes })).filter((w) => w.a);
+  } else if (m.kind === 'hover' || m.kind === 'hero') {
+    if (m.key && A.get(m.key) && T >= (m.t0 ?? -1e12)) want = [{ a: A.get(m.key), hero: true, props: m.kind === 'hero' ? m.props : null }];
+  } else if (m.kind === 'parts') {
+    want = (m.list ?? []).filter((p) => T >= p.t).map((p) => ({ a: p, hero: false }));
+  } else if (m.kind === 'follow') {
+    const eye = camera.position;
+    const cand = [...A.values()].map((a) => ({ a, d: a.v.distanceTo(eye), p: proj(a.v) })).filter((c) => c.d < 8 && c.p.ok).sort((x, y) => x.d - y.d);
+    const keep = cand.filter((c) => tags.get(c.a.key)?.on);
+    const pick = [...keep];
+    for (const c of cand) { if (pick.length >= 3) break; if (!pick.includes(c)) pick.push(c); }
+    if (!pick.some((c) => c.a.key === followHero)) followHero = pick[0]?.a.key ?? null;
+    want = pick.slice(0, 3).map((c) => ({ a: c.a, hero: c.a.key === followHero }));
+  }
+  const wantKeys = new Set(want.map((w) => w.a.key));
+  for (const [k, t] of tags) if (t.on && !wantKeys.has(k)) { t.on = false; t.tOff = T; }
+  const placed = [];
+  const order = [...want.map((w) => w.a.key), ...[...tags.keys()].filter((k) => !wantKeys.has(k))];
+  for (const k of order) {
+    const w = want.find((x) => x.a.key === k), t = w ? tagEl(w.a) : tags.get(k);
+    if (w) { if (!t.on) { t.on = true; t.tOn = T; } tagContent(t, w.a, w.hero, w.props); }
+    const alpha = t.on ? clamp((T - t.tOn) / 380) : 1 - clamp((T - t.tOff) / 320);
+    if (alpha <= 0.001) { t.d.style.opacity = 0; continue; }
+    const a = w?.a ?? A.get(k);
+    if (a) { const p = proj(a.v); if (p.ok || !t.placed) { t.sx = p.x; t.sy = p.y; } }
+    const pill = t.d.querySelector('.tp');
+    if (t.w == null) { t.w = pill.offsetWidth; t.h = pill.offsetHeight; }
+    let ok = false;
+    for (const stem of [t.stem, 56, 96, 136, 176]) {
+      for (const side of [t.side ?? 1, -(t.side ?? 1)]) {
+        const x0 = side > 0 ? t.sx - 14 : t.sx - t.w + 14, r = { x0: x0 - 6, x1: x0 + t.w + 6, y0: t.sy - stem - t.h - 6, y1: t.sy - stem + 6 };
+        if (r.x0 < 12 || r.x1 > W - 12 || r.y0 < 70 || r.y1 > H - 90) continue;
+        if (placed.some((q) => r.x0 < q.x1 && r.x1 > q.x0 && r.y0 < q.y1 && r.y1 > q.y0)) continue;
+        placed.push(r); t.stem = stem; t.side = side; ok = true; break;
+      }
+      if (ok) break;
+    }
+    t.placed = true;
+    if (!ok) { t.d.style.opacity = 0; continue; }
+    t.d.style.opacity = alpha;
+    t.d.style.transform = `translate(${t.sx}px, ${t.sy}px)`;
+    t.d.querySelector('b').style.height = t.stem + 'px'; t.d.querySelector('b').style.top = -t.stem + 'px';
+    pill.style.bottom = t.stem + 'px';
+    pill.style.left = t.side > 0 ? '-14px' : (14 - t.w) + 'px';
+    pill.style.transform = `translateY(${(1 - alpha) * 8}px) scale(${0.92 + 0.08 * alpha})`;
+  }
+}
+
+// hover: points of the object under the cursor light up, the rest dims
+let hoverKey = null, hoverAt = -1e9, pointerAt = -1e9;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!SEG || follow || !['bim', 'understand', 'design'].includes(stage)) return;
+  pointerAt = clock();
+  const k = pickObject((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  renderer.domElement.style.cursor = k ? 'pointer' : '';
+  setHover(k);
+});
+function setHover(k) {
+  if (k === hoverKey) return;
+  hoverKey = k; hoverAt = clock(); highlight(k ? [k] : []);
+  if (!tagMode || tagMode.kind === 'hover') tagMode = k ? { kind: 'hover', key: k } : null;
+}
 
 // ---------------------------------------------------------------- follow mode: first-person along the capture path
 // The camera sits on the (Catmull-Rom interpolated) LingBot-Map pose for video time t, with the video's horizontal FOV.
@@ -655,17 +1093,20 @@ function enterFollow(layer) {
   if (!meta?.cameras?.length) return;
   if (!FOLLOW_LAYERS.includes(layer)) layer = 'cloud';
   if (!track) track = buildTrack();
-  if (!follow) { follow = { t: CAPTURE ? 0 : video.currentTime, layer }; if (!CAPTURE) { video.loop = true; video.playbackRate = 1; video.play().catch(() => {}); } }
+  if (!follow) { follow = { t: CAPTURE ? 0 : video.currentTime, layer, labels: PARAMS.get('labels') === '1', tint: PARAMS.get('tint') === '1' }; if (!CAPTURE) { video.loop = true; video.playbackRate = 1; video.play().catch(() => {}); } }
   follow.layer = layer; document.body.dataset.follow = layer;
   camera.fov = followFov(); camera.near = 0.03; camera.updateProjectionMatrix(); updateScale();
   const hasCloud = layer === 'cloud' || layer.startsWith('cloud+'), which = layer.includes('bim') ? 'bim' : layer.includes('design') ? 'design' : null;
   anim = null; cutNow = Infinity; setWipe(null); clipCeiling.constant = 1e6; overlay.visible = false; $('#labels').style.display = 'none';
+  heroMeshOn = true; highlight([]);
   if (cloud) {
-    cloud.visible = hasCloud; frustum.visible = pathLine.visible = false; cloud.geometry.setDrawRange(0, meta.n);
+    cloud.visible = hasCloud || (!!which && SEG); frustum.visible = pathLine.visible = false; cloud.geometry.setDrawRange(0, meta.n);
+    cloudU.uBgOp.value = hasCloud || !which ? 1 : 0; cloudU.uBgClip.value = 1e6; cloudU.uDim.value = cloudU.uLift.value = 0; cloudU.uObjOp.value = 1; meshCut.constant = 1e6;   // model layers keep the objects' own points
     const u = cloudU; u.uReveal.value = meta.n; u.uFresh.value = 1; u.uOpModel.value = u.uOpScan.value = 1;
     u.uSize.value = (meta.voxel_m ?? 0.02) * 1.3; u.uMinPx.value = 1.5; u.uMaxPx.value = 13; u.uRound.value = 0;
   }
   world.visible = !!which;
+  objXf.forEach((X) => X && (X.hide = 0));
   if (which) {
     base = baseline();
     const m = which === 'bim' ? base : S?.model;
@@ -674,6 +1115,7 @@ function enterFollow(layer) {
     groups.forEach((r) => { setFlag(r, null); r.near = null; });
     setModelOpacity(hasCloud ? 0.45 : 1);
     if (which === 'design') groups.forEach(addGhost); else dropGhosts();     // proposed work stays visible through scanned equipment
+    for (const o of heroes()) if (objXf[o.index]) objXf[o.index].hide = elementFor(o.key) && meshFor(elementFor(o.key)) ? 1 : 0;   // the mesh stands in for its points
 
   }
   hemi.intensity = which && !hasCloud ? 2.3 : 1.6;
@@ -727,14 +1169,19 @@ function followTick() {
     if (W > 0) { const a = clamp(Math.floor(f - W), 0, F), b = clamp(Math.ceil(f + W) + 1, 0, F); cloudU.uLo.value = O[a]; cloudU.uReveal.value = O[b] ?? meta.n; }
     else { cloudU.uLo.value = 0; cloudU.uReveal.value = meta.n; }
   }
+  if (cloudU) cloudU.uTint.value = follow.tint && cloud.visible ? 1 : 0;
+  updateObjects(clock());
+  if (follow.labels) { if (tagMode?.kind !== 'follow') tagMode = { kind: 'follow' }; } else tagMode = null;
   for (const r of groups.values()) {      // never render from inside a box: hide elements that contain the eye
     if (r.el.kind === 'slab' || r.el.kind === 'space') continue;
     r.box ??= elementBox(r.el);
     const k = clamp((r.box.distanceToPoint(camera.position) - 0.35) / 1.0);   // fade boxes the eye is in or right against
     r.group.visible = k > 0.02;
     if (r.near !== k) { r.near = k; nearFade(r, k); }
+    if (r.hero && !heroMeshOn) r.group.visible = false;
   }
   renderer.render(scene, camera);
+  updateTags(follow.t * 1000);
 }
 
 addEventListener('keydown', (e) => {      // f: follow mode, 1-6: layer, Esc: back to the stages
@@ -763,7 +1210,7 @@ function tick(now) {
   animateStage(now);
   stepReplay(now);
   if (autoplay) {
-    if (status().done) { holdAt ||= now; if (now - holdAt > 900) { holdAt = 0; const nx = { scan: 'cloud', cloud: 'bim', bim: 'design' }[stage]; if (nx) setStage(nx); else autoplay = false; } }
+    if (status().done) { holdAt ||= now; if (now - holdAt > 900) { holdAt = 0; const nx = { scan: 'cloud', cloud: 'bim', bim: SEG ? 'understand' : 'design', understand: 'design' }[stage]; if (nx) setStage(nx); else autoplay = false; } }
   }
   updateCamera(now);
   renderer.render(scene, camera);
@@ -790,7 +1237,34 @@ let cursor = { x: innerWidth * 0.62, y: innerHeight * 0.55, fx: 0, fy: 0, tx: 0,
 window.__demo = {
   capture: CAPTURE,
   status,
-  go: (s) => { autoplay = false; setStage(s); return status(); },
+  go: (s, opts) => { autoplay = false; setStage(s, opts ?? {}); return status(); },
+  release: () => { held = false; busyUntil = clock() + 300; setHover(null); return status(); },
+  objectScreen: (k) => objectScreen(k),
+  hoverKey: () => hoverKey,
+  replanTargets: () => {        // elements whose objects move in the queued history (for @chips)
+    const now = new Map([...groups.values()].map((r) => [r.el.id, r.el]));
+    const out = [];
+    for (const ev of queue) for (const e of Object.values(ev.model.elements)) {
+      const a = now.get(e.id); if (a?.object_key && !out.some((x) => x.id === e.id) && Math.hypot(e.pose.pos[0] - a.pose.pos[0], e.pose.pos[1] - a.pose.pos[1]) > 0.05) out.push({ id: e.id, key: a.object_key, label: a.label });
+    }
+    return out;
+  },
+  dry: false,
+  partNames: () => queue.filter((h) => h.action === 'add_part').map((h) => (h.caption || '').split(' added to ')[0]).filter(Boolean),
+  _orient() {   // test aid: world centroid of red / yellow vertices of each hero mesh vs its pose
+    const out = [];
+    for (const r of groups.values()) {
+      const m = r.parts.find((p) => p.hero)?.bg.children.find((o) => o.isMesh); if (!m) continue;
+      m.updateMatrixWorld(true); const c = m.geometry.attributes.color, P = m.geometry.attributes.position, acc = { red: [0, 0, 0, 0], yellow: [0, 0, 0, 0] };
+      for (let i = 0; i < P.count; i++) {
+        const R = c.getX(i), G = c.getY(i), B = c.getZ(i), k = R > 0.4 && G < 0.15 ? 'red' : R > 0.5 && G > 0.4 && B < 0.15 ? 'yellow' : null; if (!k) continue;
+        const v = new THREE.Vector3(P.getX(i), P.getY(i), P.getZ(i)).applyMatrix4(m.matrixWorld); acc[k][0] += v.x; acc[k][1] += v.y; acc[k][2] += v.z; acc[k][3]++;
+      }
+      const f = (a) => a[3] ? a.slice(0, 3).map((x) => +(x / a[3]).toFixed(2)) : null;
+      out.push({ key: r.el.object_key, pos: r.el.pose.pos, yaw_deg: +(r.el.pose.yaw * 180 / Math.PI).toFixed(1), size: r.el.size, red_column: f(acc.red), yellow_knob: f(acc.yellow) });
+    }
+    return out;
+  },
   poll: () => poll().then(status),
   async frame(ms) {            // advance the virtual clock to ms, render, line the video up, settle CSS
     vnow = ms;
@@ -806,9 +1280,10 @@ window.__demo = {
   },
   cursor(x, y, ms = 800, show = true) { Object.assign(cursor, { fx: cursor.x, fy: cursor.y, tx: x, ty: y, t0: vnow, ms: Math.max(1, ms) }); $('#cursor').style.display = show ? 'block' : 'none'; },
   click() { const c = $('#cursor'); c.classList.remove('click'); void c.offsetWidth; c.classList.add('click'); },
-  async follow(layer, t) {   // first-person render of one layer at video time t (s); the video layer seeks the <video>
+  async follow(spec, t) {    // first-person render of one layer at video time t (s): 'cloud', 'bim:labels', 'cloud:tint', ...
+    const [layer, ...o] = spec.split(':');
     if (!follow || follow.layer !== layer) enterFollow(layer);
-    follow.t = t;
+    follow.t = t; follow.labels = o.includes('labels'); follow.tint = o.includes('tint');
     if (layer === 'video') await seekVideo(Math.min(vdur() - 0.02, t));
     followTick();
     return { layer, t, frame: t / frameDt(), fov: camera.fov };
@@ -818,10 +1293,11 @@ window.__demo = {
 
 if (!CAPTURE) addEventListener('error', () => {});
 await loadCloud();
+await loadObjects();
 await new Promise((r) => (video.readyState >= 1 ? r() : (video.addEventListener('loadedmetadata', r, { once: true }), video.addEventListener('error', r, { once: true }), setTimeout(r, 4000))));
 await poll();
 const start = location.hash.slice(1);
-setStage(['scan', 'cloud', 'bim', 'design'].includes(start) ? start : 'scan');
+setStage(['scan', 'cloud', 'bim', 'understand', 'hero', 'replan', 'modeledit', 'design'].includes(start) ? start : 'scan');
 if (PARAMS.get('follow') && meta) enterFollow(PARAMS.get('follow'));
 if (CAPTURE) { video.pause(); window.__demo.ready = true; }
 else {

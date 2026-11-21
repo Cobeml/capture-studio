@@ -34,6 +34,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -41,8 +42,10 @@ import numpy as np
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
-STAGES = [("scan", "01_video"), ("cloud", "02_point_cloud"), ("bim", "03_bim"), ("design", "04_agentic_design")]
-MAX_S = {"scan": 10, "cloud": 40, "bim": 16, "design": 150}
+STAGES = [("scan", "01_video"), ("cloud", "02_point_cloud"), ("bim", "03_bim"), ("understand", "05_understand"),
+          ("hero", "06_hero_model"), ("replan", "07_replan"), ("modeledit", "08_model_edit"), ("design", "04_agentic_design")]
+MAX_S = {"scan": 10, "cloud": 40, "bim": 22, "understand": 20, "hero": 16, "replan": 60, "modeledit": 60, "design": 150}
+SEG_STAGES = {"understand", "hero"}
 GL_ARGS = {
     "gpu": ["--use-gl=angle", "--use-angle=gl-egl", "--enable-gpu", "--ignore-gpu-blocklist", "--enable-gpu-rasterization"],
     "swiftshader": ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
@@ -56,7 +59,16 @@ def parse():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--size", default="1920x1080")
     ap.add_argument("--gl", choices=["auto", "gpu", "swiftshader"], default="auto")
-    ap.add_argument("--stages", default="scan,cloud,bim,design", help="comma list (subset of scan,cloud,bim,design)")
+    ap.add_argument("--stages", default="scan,cloud,bim,understand,hero,replan,modeledit,design",
+                    help="comma list, recorded in this order: scan,cloud,bim,understand,hero,replan,modeledit,design "
+                         "(object stages are skipped when the scan has no segmentation / heroes / moves / parts)")
+    ap.add_argument("--scenario", default=None, help="load_scenario NAME once before recording (needs a non-production server)")
+    ap.add_argument("--clip-scenario", default="", help="per-clip scenarios, e.g. replan=replan,modeledit=model_edit")
+    ap.add_argument("--allow-mutate", action="store_true", help="allow scenario loads / ask_user / sent prompts on port 8642")
+    ap.add_argument("--send-prompts", action="store_true", help="really POST the typed prompts (default: typed for the camera only)")
+    ap.add_argument("--hero", default=None, help="object key for 06_hero_model (default: first hero)")
+    ap.add_argument("--replan-prompt", default="Move these to open up the aisle to the exit")
+    ap.add_argument("--edit-prompt", default=None, help="prompt typed in 08_model_edit (default: from the parts added)")
     ap.add_argument("--no-hitl", action="store_true", help="no typed message / question card in the design stage")
     ap.add_argument("--message", default="Keep a clear aisle to the exit")
     ap.add_argument("--question", default=None, help="ask_user question if none is pending (default: derived from issues)")
@@ -67,7 +79,8 @@ def parse():
     ap.add_argument("--follow-speed", type=float, default=1.0, help="playback speed of the follow clips (2 = twice as fast)")
     ap.add_argument("--follow-win", type=float, default=12, help="show cloud points from +-N reconstruction frames (0 = all)")
     ap.add_argument("--follow-smooth", type=float, default=0, help="gaussian smoothing of the pose track, sigma in frames")
-    ap.add_argument("--follow-layers", default="cloud,bim,design", help="rendered layers (the video layer is always made)")
+    ap.add_argument("--follow-layers", default="auto", help="rendered layers, e.g. cloud,bim,design,cloud:labels,cloud:tint,bim:labels "
+                    "(auto: those three, plus the labelled/tinted ones when the scan has objects); the video layer is always made")
     return ap.parse_args()
 
 
@@ -151,6 +164,51 @@ class Recorder:
         self.pg.mouse.click(x, y)
         self.frame(4)
 
+    def to_object(self, key, ms=800):
+        p = self.pg.evaluate("k => window.__demo.objectScreen(k)", key)
+        if not p:
+            return None
+        self.pg.evaluate("([x, y, ms]) => window.__demo.cursor(x, y, ms)", [p["x"], p["y"], ms])
+        self.seconds(ms / 1000 + 0.1)
+        return self.pg.evaluate("k => window.__demo.objectScreen(k)", key)
+
+    def click_object(self, key, shift=False):
+        p = self.to_object(key)
+        if not p:
+            return
+        self.pg.evaluate("() => window.__demo.click()")
+        if shift:
+            self.pg.keyboard.down("Shift")
+        self.pg.mouse.click(p["x"], p["y"])
+        if shift:
+            self.pg.keyboard.up("Shift")
+        self.frame(8)
+
+    def type_prompt(self, text, send=True):
+        self.click("#say input")
+        for ch in text:
+            self.pg.keyboard.type(ch)
+            self.frame(2)
+        self.seconds(0.4)
+        if send:
+            self.click("#say form button")
+        self.seconds(1.0)
+
+    def hide_cursor(self):
+        self.pg.evaluate("() => window.__demo.cursor(innerWidth * 0.7, innerHeight * 0.6, 600, false)")
+
+
+def load_scenario(base, name, args, pg=None):
+    if production(base) and not args.allow_mutate:
+        sys.exit(f"refusing to load scenario {name!r} on {base} (production port); pass --allow-mutate if you really mean it")
+    print("  load_scenario", name, mcp(base, "load_scenario", {"name": name}).strip().splitlines()[-1][:160])
+    if pg is not None:
+        time.sleep(0.3); pg.evaluate("() => window.__demo.poll()"); pg.evaluate("() => window.__demo.poll()")
+
+
+def production(base):
+    return urllib.parse.urlparse(base).port in (8642, None)
+
 
 def hitl(rec, args, base):
     pg = rec.pg
@@ -214,21 +272,72 @@ def main():
         pg.goto(base + "/?capture=1")
         pg.wait_for_function("window.__demo && window.__demo.ready", timeout=120000)
         rec = Recorder(pg, args.fps, args.crf)
+        pg.evaluate("d => { window.__demo.dry = d; }", not args.send_prompts)
+        if production(base) and not args.allow_mutate and not args.no_hitl:
+            print("  production server: HITL (message + ask_user) disabled; pass --allow-mutate to enable")
+            args.no_hitl = True
+        if args.scenario:
+            load_scenario(base, args.scenario, args, pg)
+        per_clip = dict(x.split("=", 1) for x in args.clip_scenario.split(",") if "=" in x)
         clips = []
-        for stage, name in STAGES:
-            if stage not in want:
+        order = [s_.strip() for s_ in args.stages.split(",") if s_.strip()]
+        names = dict(STAGES)
+        for stage in order:
+            name = names.get(stage)
+            if not name:
+                continue
+            if stage in per_clip:
+                load_scenario(base, per_clip[stage], args, pg)
+            info = pg.evaluate("() => window.__demo.status()")
+            if stage in SEG_STAGES and not (info["seg"] and (stage != "hero" or info["heroes"])):
+                print(f"{name}: skipped (no segmented objects{' / hero meshes' if stage == 'hero' else ''})")
                 continue
             path = out / f"{name}.mp4"
             rec.enc = encoder(path, args.fps, args.crf)
             t0, f0 = time.time(), rec.frames
-            pg.evaluate("s => window.__demo.go(s)", stage)
+            opts = {"hold": True} if stage in ("replan", "modeledit") else {}
+            if stage == "hero":
+                opts = {"key": args.hero or info["heroes"][0]}
+            st = pg.evaluate("([s, o]) => window.__demo.go(s, o)", [stage, opts])
+            if stage in ("replan", "modeledit") and not st["queue"]:
+                rec.enc.stdin.close(); rec.enc.wait(); path.unlink(missing_ok=True)
+                print(f"{name}: skipped (no {'move_element' if stage == 'replan' else 'add_part'} events in this history; see --clip-scenario)")
+                continue
+            if stage == "hero":
+                rec.frame(3)
+                rec.to_object(opts["key"], 850)
+                pg.evaluate("() => window.__demo.click()")
+            if stage == "replan":
+                rec.seconds(1.6)
+                for tg in pg.evaluate("() => window.__demo.replanTargets()"):
+                    rec.click_object(tg["key"], shift=True)
+                rec.type_prompt(args.replan_prompt)
+                rec.hide_cursor(); pg.evaluate("() => window.__demo.release()")
+            if stage == "modeledit":
+                rec.seconds(1.8)
+                key = pg.evaluate("() => window.__demo.status().focusKey")
+                if key:
+                    rec.click_object(key)
+                parts = pg.evaluate("() => window.__demo.partNames()")
+                rec.type_prompt(args.edit_prompt or ("Add " + ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1]
+                                                     if parts else "Edit this machine's model").replace("Add , ", "Add "))
+                rec.hide_cursor(); pg.evaluate("() => window.__demo.release()")
             n = 0
             while n < MAX_S[stage] * args.fps:
                 st = rec.frame(); n += 1
+                if stage == "understand":            # the cursor rides along with the object being hovered
+                    k = st.get("hoverKey")
+                    if k and n % 3 == 0:
+                        p_ = pg.evaluate("k => window.__demo.objectScreen(k)", k)
+                        if p_:
+                            pg.evaluate("([x, y]) => window.__demo.cursor(x + 6, y + 4, 260)", [p_["x"], p_["y"]])
+                    elif not k and n % 3 == 0:
+                        rec.hide_cursor()
                 if st["done"]:
                     break
             if stage == "design" and not args.no_hitl:
                 hitl(rec, args, base)
+            rec.hide_cursor()
             rec.seconds(0.6 if stage != "design" else 1.0)
             rec.enc.stdin.close(); rec.enc.wait()
             nf = rec.frames - f0
@@ -254,6 +363,18 @@ def probe_fps(path):
     st = json.loads(r.stdout)["streams"][0]
     n, d = st["r_frame_rate"].split("/")
     return float(n) / float(d), float(st.get("duration") or 0)
+
+
+def fname(layer):
+    return layer.replace(":labels", "_labeled").replace(":", "_").replace("+", "_")
+
+
+def _exists(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def follow(pg, args, base, out, w, h):
@@ -283,14 +404,16 @@ def follow(pg, args, base, out, w, h):
                     "-frames:v", str(n), "-c:v", "libx264", "-preset", "medium", "-crf", str(args.crf), "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart", str(out / "follow_video.mp4")], check=True)
 
-    layers = [l.strip() for l in args.follow_layers.split(",") if l.strip()]
+    has_obj = _exists(base + "/data/scan/objects.json")
+    layers = (["cloud", "bim", "design"] + (["cloud:labels", "cloud:tint", "bim:labels"] if has_obj else [])) if args.follow_layers == "auto" \
+        else [l.strip() for l in args.follow_layers.split(",") if l.strip()]
     q = f"?capture=1&frame_dt={frame_dt:.7f}&win={args.follow_win:g}&smooth={args.follow_smooth:g}"
     errors = []
     pg.on("pageerror", lambda e: errors.append(str(e)))
     pg.goto(base + "/" + q)
     pg.wait_for_function("window.__demo && window.__demo.ready", timeout=180000)
     cdp = pg.context.new_cdp_session(pg)
-    encs = {l: encoder(out / f"follow_{l.replace('+', '_')}.mp4", fps, args.crf) for l in layers}
+    encs = {l: encoder(out / f"follow_{fname(l)}.mp4", fps, args.crf) for l in layers}
     for k in range(n):
         t = start + k * speed / fps
         for l in layers:
@@ -304,8 +427,9 @@ def follow(pg, args, base, out, w, h):
     print(f"follow layers: {n} frames x {len(layers) + 1} in {time.time() - t0:.0f} s")
     if errors:
         print("page errors:", errors[:5])
-    names = {"video": "VIDEO", "cloud": "POINT CLOUD", "bim": "AS-BUILT BIM", "design": "DESIGN"}
-    have = [l for l in ["video", "cloud", "bim", "design"] if (out / f"follow_{l}.mp4").exists()]
+    names = {"video": "VIDEO", "cloud": "POINT CLOUD", "bim": "AS-BUILT BIM", "design": "DESIGN", "bim_labeled": "AS-BUILT BIM", "cloud_labeled": "POINT CLOUD"}
+    model = "bim_labeled" if "bim:labels" in layers else "bim"
+    have = [l for l in ["video", "cloud", model, "design"] if (out / f"follow_{l}.mp4").exists()]
     if len(have) >= 2:
         matchcut(out, have, names, n, fps, w, h, args.crf)
         split(out, have, names, fps, w, h, args.crf)
