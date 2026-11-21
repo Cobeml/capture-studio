@@ -172,3 +172,41 @@ def test_equipment_recovered_as_boxes_not_walls(fitted):
         assert math.dist(e["pos"], (cx, cy)) < 0.12
         assert abs(e["size"][0] - sx) < 0.15 and abs(e["size"][1] - sy) < 0.15 and abs(e["size"][2] - h) < 0.15
         assert e["provenance"] == "scanned" and e["color"].startswith("#")
+
+
+OBJECTS = [  # what capture_studio.objects writes: segmented + named objects (one hangs past the east wall)
+    {"key": "obj_01", "index": 1, "label": "Haas SL-30 CNC lathe", "category": "machine",
+     "function": "Turns round metal parts.", "confidence": 0.9, "label_source": "gemini+reviewed",
+     "pos": [2.0, 3.6], "size": [1.6, 0.9, 1.4], "yaw_deg": 0.0, "color": "#c0c0c0", "points": 5000,
+     "mesh": "obj_01", "hero": True, "views": [1, 2]},
+    {"key": "obj_02", "index": 2, "label": "Tool cart", "category": "cart", "function": "Holds tool holders.",
+     "confidence": 0.8, "label_source": "gemini", "pos": [6.6, 3.8], "size": [1.2, 0.6, 1.0], "yaw_deg": 90.0,
+     "color": "#cc2222", "points": 900, "mesh": None, "views": [3]},
+    {"key": "obj_03", "index": 3, "label": "Car outside", "category": "other", "function": "", "confidence": 0.5,
+     "label_source": "gemini", "pos": [5.0, -3.0], "size": [4.0, 1.8, 1.4], "yaw_deg": 0.0, "color": "#333333",
+     "points": 100, "mesh": None, "views": [4]},
+]
+
+
+def test_objects_json_replaces_box_clustering(tmp_path):
+    from capture_studio import fit
+    synth(tmp_path)
+    (tmp_path / "scan" / "objects.json").write_text(json.dumps({"version": 1, "objects": OBJECTS}))
+    old = fit.SCAN
+    fit.SCAN = tmp_path / "scan"
+    try:
+        model, report = fit.fit_shell()
+    finally:
+        fit.SCAN = old
+    eq = {e["object_key"]: e for e in model["elements"].values() if e["kind"] == "equipment"}
+    assert set(eq) == {"obj_01", "obj_02"}                         # outside the shell -> dropped
+    lathe, cart = eq["obj_01"], eq["obj_02"]
+    assert lathe["name"] == lathe["label"] == "Haas SL-30 CNC lathe" and lathe["category"] == "machine"
+    assert lathe["function"] and lathe["mesh"] == "obj_01" and lathe["hero"] and lathe["confidence"] == 0.9
+    assert lathe["material"] == "machine" and lathe["anchored"] and lathe["fixed"] and lathe["provenance"] == "scanned"
+    assert lathe["origin"] == {"pos": lathe["pos"], "yaw_deg": lathe["yaw_deg"]}
+    assert cart["category"] == "bench" and cart["object_category"] == "cart" and cart["mesh"] is None
+    # the cart's box poked through the east wall face (x = 6.9): it is pushed back inside the room
+    xs = [p[0] for p in bim.footprint(model, cart)]
+    assert max(xs) <= 6.9 + 1e-6, xs
+    assert "label" in bim.brief(model, lathe) and report["scan"]["objects"].startswith("segmented")
