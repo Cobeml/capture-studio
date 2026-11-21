@@ -7,3 +7,4 @@ data/scan/raw_predictions.npz
 __pycache__/
 *.pyc
 .env
+data/*.mp4
