@@ -25,10 +25,10 @@ from . import bim, codes, physics, store
 mcp = FastMCP(
     "capture-studio", host="127.0.0.1", port=int(os.environ.get("CAPTURE_STUDIO_PORT", 8642)), stateless_http=True, json_response=True,
     instructions=(
-        "Capture Studio turns a phone video of a construction site into an editable BIM model.\n"
+        "Capture Studio turns a phone video of a site (factory floor, building under construction) into an editable BIM model.\n"
         "Workflow: 1) reconstruct_scan  2) fit_bim (as-built shell, provenance=scanned)  "
         "3) get_user_messages / list_requirements to learn what the client wants  "
-        "4) design with add_space / add_wall / add_opening / add_fixture / update_element / remove_element  "
+        "4) design with add_space / add_equipment / add_wall / add_opening / add_fixture / update_element / remove_element  "
         "5) validate — fix every 'fail', resolve every 'hold' by asking the user (ask_user -> record_approval), "
         "re-validate until ok  6) set_next_steps, commit_revision, export_package.\n"
         "Units are metres, Z up, origin at the shell's min corner. Use say() for one short line "
@@ -161,10 +161,12 @@ def reconstruct_scan(fps: int = 6, force: bool = False) -> dict:
 
 
 @mcp.tool()
-def fit_bim(reset_design: bool = False) -> dict:
-    """Stage 2→3. Fit the as-built shell (slab, walls, doors, windows) to the point cloud and
-    create revision R1. Every fitted element is provenance='scanned' and carries its fit residual
-    to the scan (P50/P95 mm). Refuses to overwrite an existing design unless reset_design=true."""
+def fit_bim(reset_design: bool = False, site_type: str = "factory") -> dict:
+    """Stage 2→3. Fit the as-built model to the point cloud and create revision R1: floor slab,
+    walls with doors/windows, and existing equipment (machines, racks, benches as scan-coloured
+    boxes). Every fitted element is provenance='scanned' and carries its fit residual to the scan
+    (P50/P95 mm). site_type: 'factory' (OSHA_1910 profile) or 'residential' (NBC_INDIA_2016).
+    Refuses to overwrite an existing design unless reset_design=true."""
     from . import fit
     s = store.load()
     if any(e["provenance"] == "proposed" for e in s["model"]["elements"].values()) and not reset_design:
@@ -172,6 +174,8 @@ def fit_bim(reset_design: bool = False) -> dict:
     keep = {k: s[k] for k in ("messages", "requirements")}
     s = store.fresh() | keep
     s["model"], report = fit.fit_shell()
+    s["model"]["project"]["code_profile"] = "OSHA_1910" if site_type == "factory" else "NBC_INDIA_2016"
+    s["model"]["project"]["site_type"] = site_type
     s["model"]["revision"] = 1
     s["stage"] = "bim"
     _validate(s, run_physics=False)
@@ -264,6 +268,28 @@ def add_fixture(state, name: str, pos: list[float], size: list[float], yaw_deg: 
 
 
 @mcp.tool()
+@edit(lambda r, kw: f"{r['name']} placed")
+def add_equipment(state, name: str, pos: list[float], size: list[float], yaw_deg: float = 0.0,
+                  category: str = "machine", mass_kg: float | None = None, anchored: bool = False,
+                  hazard: bool = False, guarded: bool = False) -> dict:
+    """Place production equipment on the floor: pos = [x,y] of its centre, size = [length, depth, height] m.
+    category: machine | robot | rack | tank | conveyor | bench. mass_kg is the real installed mass
+    (if omitted a typical density is assumed). hazard=true for anything with a point of operation or
+    moving parts (needs guarded=true once guarding is specified). Fixed machines and racks must be
+    anchored=true; keep the profile's working clearance to neighbours and stay out of aisles."""
+    m = state["model"]
+    cats = ("machine", "robot", "rack", "tank", "conveyor", "bench")
+    if category not in cats:
+        raise ValueError(f"category must be one of {cats}")
+    props = dict(name=name, pos=pos, size=size, yaw_deg=yaw_deg, category=category, anchored=anchored,
+                 hazard=hazard, guarded=guarded, fixed=category != "bench",
+                 material="racking" if category == "rack" else "machine")
+    if mass_kg:
+        props["mass_kg"] = mass_kg
+    return bim.brief(m, bim.add(m, "equipment", **props))
+
+
+@mcp.tool()
 @edit(lambda r, kw: f"Column added")
 def add_column(state, pos: list[float], size: list[float] = [0.23, 0.23], height: float | None = None,
                material: str = "concrete", anchored: bool = True, name: str | None = None) -> dict:
@@ -278,9 +304,11 @@ def add_column(state, pos: list[float], size: list[float] = [0.23, 0.23], height
 @mcp.tool()
 @edit(lambda r, kw: f"{r['name']} · {r['area']} m²")
 def add_space(state, name: str, use: str, polygon: list[list[float]]) -> dict:
-    """Declare a room: polygon = [[x,y],…] corners in order (use the wall centrelines).
-    use: living | bedroom | office | dining | study | kitchen | bathroom | store | corridor.
-    Code rules (area, width, daylight, doors, egress) are evaluated per space."""
+    """Declare a zone or room: polygon = [[x,y],…] corners in order.
+    use depends on the code profile (see get_code_rules -> room). Factory: work_cell | assembly |
+    storage | aisle | forklift_aisle | office | exit_access (the way out, if no exit door was scanned).
+    Residential: living | bedroom | office | dining | study | kitchen | bathroom | store | corridor.
+    Rules (size, clear width, egress route to the exit, aisles kept clear) are evaluated per space."""
     m = state["model"]
     prof = codes.PROFILES[m["project"]["code_profile"]]
     if use not in prof["room"]:
@@ -363,7 +391,7 @@ def validate() -> dict:
 
 @mcp.tool()
 def set_code_profile(profile: str) -> dict:
-    """Switch jurisdiction: NBC_INDIA_2016 or IRC_2021."""
+    """Switch rule set: OSHA_1910 (factory), NBC_INDIA_2016 or IRC_2021 (residential)."""
     if profile not in codes.PROFILES:
         return {"error": f"one of {sorted(codes.PROFILES)}"}
     s = store.load()

@@ -90,3 +90,34 @@ def test_drop_test_nothing_falls_through():
     m, _ = shell()
     d = physics.drop_test(m, n=12)
     assert d["ok"] and d["fell_through"] == 0 and d["at_rest"] >= 10
+
+
+def factory():
+    m, w = shell()
+    m["project"]["code_profile"] = "OSHA_1910"
+    bim.add(m, "equipment", "scanned", name="Existing lathe", pos=[6.5, 4.5], size=[2.0, 1.0, 1.6], category="machine",
+            material="machine", anchored=True)
+    bim.add(m, "space", name="Main aisle", use="aisle", polygon=[[0.2, 2.2], [7.8, 2.2], [7.8, 3.8], [0.2, 3.8]])
+    return m
+
+
+def test_factory_machine_needs_guard_anchor_clearance_and_clear_aisle():
+    m = factory()
+    cnc = bim.add(m, "equipment", name="CNC mill", pos=[6.5, 3.0], size=[2.4, 1.6, 2.2], category="machine",
+                  material="machine", mass_kg=4500, hazard=True, fixed=True)
+    k = keys(codes.check(m))
+    assert {"guarding", "anchor", "clearance", "aisle"} <= k, k
+    cnc.update(pos=[2.5, 1.0], guarded=True, anchored=True)
+    r = codes.check(m)
+    assert not [i for i in r["issues"] if i["severity"] == "fail"], r["issues"]
+    assert r["egress"]["paths"]          # the aisle has a clear route to the exit door
+
+
+def test_factory_unanchored_rack_topples_at_industrial_lateral_load():
+    m = factory()
+    rack = bim.add(m, "equipment", name="Shelving", pos=[2.0, 5.2], size=[2.7, 0.45, 2.2], category="rack",
+                   material="racking", mass_kg=600)
+    r = physics.run(m)
+    assert r["lateral_g"] == 0.25 and not r["bodies"][rack["id"]]["stable"]
+    rack["anchored"] = True
+    assert physics.run(m)["ok"]

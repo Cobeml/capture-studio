@@ -38,6 +38,28 @@ PROFILES = {
         "refs": {"room": "NBC 2016 Pt 3 cl. 12.2", "light": "NBC 2016 Pt 8 §1 cl. 4", "door": "NBC 2016 Pt 3 Annex B",
                  "egress": "NBC 2016 Pt 4 cl. 4", "guard": "NBC 2016 Pt 3 cl. 12.19", "demo": "NBC 2016 Pt 7 / IS 4130"},
     },
+    "OSHA_1910": {
+        "title": "OSHA 29 CFR 1910 general industry + NFPA 101 industrial egress — demo subset",
+        "industrial": True, "rooms_need_doors": False,
+        "room": {  # zones on a production floor: (min area m2, min clear width m, min height m)
+            "work_cell": (0.0, 0.0, 2.3), "assembly": (0.0, 0.0, 2.3), "storage": (0.0, 0.0, 2.3),
+            "aisle": (0.0, 0.9, 2.3), "forklift_aisle": (0.0, 3.0, 2.3), "office": (0.0, 0.0, 2.3),
+            "exit_access": (0.0, 0.9, 2.3),
+        },
+        "light_vent_ratio": 0.0,
+        "door_clear_width": {"default": 0.813},
+        "door_min_height": 2.03,
+        "egress_clear_width": 0.711,        # 28 in exit access
+        "egress_travel_max": 61.0,          # 200 ft, general industrial, unsprinklered
+        "guard_height": 1.07,               # 42 in guardrail
+        "lintel_span_max": 1.2,
+        "machine_clearance": 0.6,           # working space around machines (demo value)
+        "lateral_g": 0.25,                  # equipment / rack anchorage screen
+        "refs": {"room": "29 CFR 1910.22 / 1910.176(a)", "light": "-", "door": "29 CFR 1910.36(g)",
+                 "egress": "29 CFR 1910.36–37 / NFPA 101 ch. 40", "guard": "29 CFR 1910.29(b)",
+                 "demo": "29 CFR 1926.850", "machine": "29 CFR 1910.212", "aisle": "29 CFR 1910.176(a)",
+                 "clearance": "29 CFR 1910.22(a) / maker's manual"},
+    },
     "IRC_2021": {
         "title": "International Residential Code 2021 — demo subset",
         "room": {u: (6.5, 2.134, 2.134) for u in HABITABLE} | {
@@ -100,7 +122,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
                       f"{s['name']} has {vent:.2f} m² of exterior openings; needs {need_v:.2f} m² "
                       f"({prof['light_vent_ratio']:.0%} of floor area).",
                       "Include an exterior window in this room, or add/enlarge one.")
-        if not doors:
+        if not doors and prof.get("rooms_need_doors", True):
             issue(f"access:{s['id']}", "code", "fail", "Room has no door", "door", s["id"],
                   f"{s['name']} has no door or opening on its boundary.", "Add a door.")
         for d in doors:
@@ -120,7 +142,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
     egress = egress_paths(model, prof["egress_clear_width"])
     if spaces and egress["exit"] is None:
         issue("egress:noexit", "code", "fail", "Means of egress", "egress", None,
-              "No door is marked as the exit.", "Mark the entrance door with exit=true.")
+              "No exit is defined.", "Mark the exit door with exit=true, or add a space with use 'exit_access' at the way out.")
     for sid, r in egress["paths"].items():
         name = els[sid]["name"]
         if r is None:
@@ -131,6 +153,38 @@ def check(model: dict, approvals: dict | None = None) -> dict:
             issue(f"travel:{sid}", "code", "fail", "Egress travel distance", "egress", sid,
                   f"Travel from {name} is {r['length']:.1f} m; limit {prof['egress_travel_max']} m.",
                   "Shorten the route or add an exit.")
+
+    # ---- industrial: guarding, anchorage, working clearance, aisles kept clear
+    if prof.get("industrial"):
+        solid = [e for e in els.values() if e["kind"] in ("equipment", "fixture", "column")]
+        aisles = [e for e in spaces if e["use"] in ("aisle", "forklift_aisle", "exit_access")]
+        for e in solid:
+            if e["provenance"] == "proposed" and e["kind"] == "equipment":
+                if e.get("hazard") and not e.get("guarded"):
+                    issue(f"guarding:{e['id']}", "safety", "fail", "Machine guarding", "machine", e["id"],
+                          f"{e['name']} has exposed hazards (point of operation / moving parts) and no guarding.",
+                          "Specify guarding: set guarded=true once a fixed guard, interlocked enclosure or light curtain is defined.")
+                if e.get("fixed", True) and not e.get("anchored"):
+                    issue(f"anchor:{e['id']}", "safety", "fail", "Machine anchorage", "machine", e["id"],
+                          f"{e['name']} is a fixed machine and is not anchored to the slab.",
+                          "Set anchored=true (anchor bolts per maker's foundation drawing).")
+                for o in solid:
+                    if o["id"] == e["id"] or (o["provenance"] == "proposed" and o["id"] < e["id"]):
+                        continue
+                    gap = bim.plan_gap(model, e, o)
+                    need = prof["machine_clearance"]
+                    if 0.0 < gap < need - 1e-6:
+                        issue(f"clearance:{e['id']}:{o['id']}", "code", "fail", "Working clearance", "clearance", e["id"],
+                              f"{e['name']} is {gap:.2f} m from {o['name']}; needs ≥ {need} m to operate and maintain it.",
+                              f"Move it {need - gap:.2f} m further away.")
+            for a in aisles:
+                fp = bim.footprint(model, e)
+                pts = fp + [bim.poly_centroid(fp)] if fp else []
+                if any(bim.point_in_poly(q, a["polygon"]) for q in pts):
+                    sev = "fail" if e["provenance"] == "proposed" else "warn"
+                    issue(f"aisle:{e['id']}:{a['id']}", "safety", sev, "Aisle obstructed", "aisle", e["id"],
+                          f"{e['name']} stands in {a['name']}; aisles must be kept clear.",
+                          "Move it out of the aisle or reroute the aisle around it.")
 
     # ---- safety
     for o in els.values():
@@ -197,6 +251,9 @@ def egress_paths(model: dict, clear_width: float) -> dict:
     els = model["elements"]
     spaces = [e for e in els.values() if e["kind"] == "space"]
     exit_door = next((e for e in els.values() if e["kind"] in ("door", "void") and e.get("exit")), None)
+    if exit_door is None:       # open-plan scans rarely capture the door itself: a declared exit-access zone will do
+        exit_door = next((e for e in spaces if e["use"] == "exit_access"), None)
+    spaces = [e for e in spaces if e is not exit_door]
     g = _grid(model)
     if not spaces or exit_door is None or g is None:
         return {"exit": exit_door and exit_door["id"], "paths": {}}
@@ -212,7 +269,8 @@ def egress_paths(model: dict, clear_width: float) -> dict:
     def to_xy(c):
         return [round(g["x0"] + (c[0] + 0.5) * cell, 3), round(g["y0"] + (c[1] + 0.5) * cell, 3)]
 
-    goal = to_cell(bim.opening_center(model, exit_door))
+    goal = to_cell(bim.poly_centroid(exit_door["polygon"]) if exit_door["kind"] == "space"
+                   else bim.opening_center(model, exit_door))
     nx, ny = free.shape
     if not (0 <= goal[0] < nx and 0 <= goal[1] < ny) or not free[goal]:
         return {"exit": exit_door["id"], "paths": {s["id"]: None for s in spaces}}

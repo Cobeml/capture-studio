@@ -19,7 +19,7 @@ import time
 IFC_CLASS = {
     "slab": "IfcSlab", "wall": "IfcWall", "door": "IfcDoor", "window": "IfcWindow",
     "void": "IfcOpeningElement", "column": "IfcColumn", "beam": "IfcBeam",
-    "fixture": "IfcFurnishingElement", "space": "IfcSpace",
+    "fixture": "IfcFurnishingElement", "equipment": "IfcBuildingElementProxy", "space": "IfcSpace",
 }
 
 # density kg/m3, unit cost (USD per m3, rough order of magnitude for takeoff only)
@@ -32,6 +32,8 @@ MATERIALS = {
     "steel": {"density": 7850, "cost_m3": 9500, "color": "#5f6b7a"},
     "glass": {"density": 2500, "cost_m3": 3000, "color": "#9fd3e6"},
     "casework": {"density": 350, "cost_m3": 900, "color": "#c9b79c"},
+    "machine": {"density": 1200, "cost_m3": 0, "color": "#7d8894"},      # enclosure-average density of a machine tool
+    "racking": {"density": 220, "cost_m3": 260, "color": "#3f6fb5"},     # loaded pallet/shelf racking, volume-averaged
 }
 
 OPENING_KINDS = ("door", "window", "void")
@@ -167,7 +169,7 @@ def solids(model: dict, el: dict) -> list[dict]:
     if k == "slab":
         sx, sy = el["max"][0] - el["min"][0], el["max"][1] - el["min"][1]
         return [{"c": [sx / 2, sy / 2, el["thickness"] / 2], "s": [sx, sy, el["thickness"]]}]
-    if k == "fixture":
+    if k in ("fixture", "equipment"):
         l, d, h = el["size"]
         return [{"c": [0, 0, h / 2], "s": [l, d, h]}]
     return []
@@ -177,8 +179,44 @@ def volume(model: dict, el: dict) -> float:
     return sum(b["s"][0] * b["s"][1] * b["s"][2] for b in solids(model, el))
 
 
+def density(model: dict, el: dict) -> float:
+    """kg/m3 used for physics: an explicit mass_kg wins over the material table."""
+    if el.get("mass_kg"):
+        return el["mass_kg"] / max(volume(model, el), 1e-6)
+    return MATERIALS[el.get("material", "concrete")]["density"]
+
+
 def mass(model: dict, el: dict) -> float:
-    return volume(model, el) * MATERIALS[el.get("material", "concrete")]["density"]
+    return volume(model, el) * density(model, el)
+
+
+def footprint(model: dict, el: dict) -> list[list[float]]:
+    """World-space plan corners of a box-like element (fixture / equipment / column)."""
+    p = pose(model, el)
+    c, s = math.cos(p["yaw"]), math.sin(p["yaw"])
+    out = []
+    for b in solids(model, el):
+        hx, hy = b["s"][0] / 2, b["s"][1] / 2
+        for dx, dy in ((-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)):
+            x, y = b["c"][0] + dx, b["c"][1] + dy
+            out.append([p["pos"][0] + x * c - y * s, p["pos"][1] + x * s + y * c])
+    return out
+
+
+def plan_gap(model: dict, a: dict, b: dict) -> float:
+    """Smallest plan distance between two elements' solids (0 if they touch/overlap)."""
+    fa, fb = footprint(model, a), footprint(model, b)
+    if not fa or not fb:
+        return float("inf")
+    best = float("inf")
+    for P, Q in ((fa, fb), (fb, fa)):
+        for i in range(0, len(Q), 4):
+            quad = Q[i:i + 4]
+            for pt in P:
+                if point_in_poly(pt, quad):
+                    return 0.0
+                best = min(best, dist_point_poly_edge(pt, quad))
+    return best
 
 
 # ---------------------------------------------------------------- spaces / 2D helpers
@@ -266,8 +304,8 @@ def brief(model: dict, e: dict) -> dict:
     elif k == "slab":
         b.update(min=_r(e["min"]), max=_r(e["max"]), top=e["top"])
     else:
-        b.update({key: e[key] for key in ("pos", "size", "yaw_deg", "start", "end", "height", "material", "anchored")
-                  if key in e})
+        b.update({key: e[key] for key in ("pos", "size", "yaw_deg", "start", "end", "height", "material", "anchored",
+                                          "category", "mass_kg", "hazard", "guarded", "fixed") if key in e})
     if "fit" in e:
         b["fit_mm"] = e["fit"]
     return b
@@ -304,5 +342,5 @@ def snapshot(model: dict) -> dict:
         e["pose"] = pose(model, e)
         e["boxes"] = solids(model, e)
         mat = e.get("material") or ("timber" if e["kind"] == "door" else "glass" if e["kind"] == "window" else "concrete")
-        e["color"] = MATERIALS[mat]["color"]
+        e["color"] = e.get("color") or MATERIALS[mat]["color"]
     return out

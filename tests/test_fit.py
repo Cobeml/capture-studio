@@ -13,6 +13,7 @@ import pytest
 from capture_studio import bim
 
 H = 2.9
+MACHINES = [(2.0, 3.6, 1.6, 0.9, 1.4), (5.6, 3.8, 1.2, 1.0, 2.0)]   # cx, cy, length, depth, height
 
 
 def truth():
@@ -69,6 +70,17 @@ def synth(tmp):
                 loc = np.stack([U.ravel(), np.full(U.size, side * b["s"][1] / 2), Z.ravel()], 1)
                 pts.append(np.stack([ps["pos"][0] + loc[:, 0] * c - loc[:, 1] * s,
                                      ps["pos"][1] + loc[:, 0] * s + loc[:, 1] * c, loc[:, 2]], 1))
+    for (cx, cy, sx, sy, h) in MACHINES:                                         # box "machines": 4 sides + top
+        for u in np.arange(-sx / 2, sx / 2, g):
+            for side in (-sy / 2, sy / 2):
+                z = np.arange(0, h, g)
+                pts.append(np.stack([np.full(z.size, cx + u), np.full(z.size, cy + side), z], 1))
+        for v in np.arange(-sy / 2, sy / 2, g):
+            for side in (-sx / 2, sx / 2):
+                z = np.arange(0, h, g)
+                pts.append(np.stack([np.full(z.size, cx + side), np.full(z.size, cy + v), z], 1))
+        U, V = np.meshgrid(np.arange(-sx / 2, sx / 2, g), np.arange(-sy / 2, sy / 2, g))
+        pts.append(np.stack([cx + U.ravel(), cy + V.ravel(), np.full(U.size, h)], 1))
     X, Y = np.meshgrid(np.arange(0.1, 6.9, g * 1.5), np.arange(0.1, 4.9, g * 1.5))
     pts.append(np.stack([X.ravel(), Y.ravel(), np.zeros(X.size)], 1))            # floor
     pts.append(np.stack([X.ravel(), Y.ravel(), np.full(X.size, H)], 1))          # ceiling
@@ -149,3 +161,14 @@ def test_surfaces_seen_through_openings_are_not_walls(fitted):
     model, _ = fitted
     assert not list(_wall_at(model, 0, -1.6, 0.2)) and not list(_wall_at(model, 1, -3.0, 0.2))
     assert sum(e["kind"] == "wall" for e in model["elements"].values()) == 5
+
+
+def test_equipment_recovered_as_boxes_not_walls(fitted):
+    model, _ = fitted
+    eq = [e for e in model["elements"].values() if e["kind"] == "equipment"]
+    assert len(eq) == len(MACHINES), [bim.brief(model, e) for e in eq]
+    for cx, cy, sx, sy, h in MACHINES:
+        e = min(eq, key=lambda e: math.dist(e["pos"], (cx, cy)))
+        assert math.dist(e["pos"], (cx, cy)) < 0.12
+        assert abs(e["size"][0] - sx) < 0.15 and abs(e["size"][1] - sy) < 0.15 and abs(e["size"][2] - h) < 0.15
+        assert e["provenance"] == "scanned" and e["color"].startswith("#")

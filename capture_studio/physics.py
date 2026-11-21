@@ -25,7 +25,7 @@ import numpy as np
 from . import bim
 
 G = 9.81
-DYNAMIC_KINDS = ("wall", "fixture", "column", "beam")
+DYNAMIC_KINDS = ("wall", "fixture", "equipment", "column", "beam")
 SLIDE_LIMIT, TILT_LIMIT_DEG = 0.02, 2.0
 
 
@@ -78,7 +78,7 @@ def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None) -> t
             continue
         p = bim.pose(model, e)
         is_dyn = e["provenance"] == "proposed" and e["kind"] in DYNAMIC_KINDS
-        dens = bim.MATERIALS[e.get("material", "concrete")]["density"]
+        dens = bim.density(model, e)
         geoms = "".join(
             f'<geom type="box" pos="{b["c"][0]:.4f} {b["c"][1]:.4f} {b["c"][2]:.4f}" '
             f'size="{b["s"][0] / 2:.4f} {b["s"][1] / 2:.4f} {b["s"][2] / 2:.4f}" density="{dens}"/>'
@@ -168,9 +168,12 @@ def _tilt_test(m, d, ids, lateral_g, seconds, record=False):
     return worst, tie_peak, frames_by_dir
 
 
-def run(model: dict, lateral_g=0.15, erection_g=0.05) -> dict:
+def run(model: dict, lateral_g: float | None = None, erection_g=0.05) -> dict:
     """Full robustness report for the current design."""
     els = model["elements"]
+    if lateral_g is None:
+        from . import codes
+        lateral_g = codes.PROFILES[model["project"]["code_profile"]].get("lateral_g", 0.15)
     xml, info = build_mjcf(model, with_ties=True)
     ids = info["dynamic"]
     report = {"lateral_g": lateral_g, "erection_g": erection_g, "bodies": {}, "issues": [],
@@ -225,7 +228,7 @@ def run(model: dict, lateral_g=0.15, erection_g=0.05) -> dict:
                 anim_dir, anim_score = k, max(slide / SLIDE_LIMIT, tilt / TILT_LIMIT_DEG)
             how = "topples" if tilt >= TILT_LIMIT_DEG else "slides"
             fix = ("Run it into an existing wall so it can be tied in, or set head_restraint=true "
-                   "(fixed to the soffit)." if e["kind"] == "wall" else "Set anchored=true (fix to slab/wall) or make it lower / deeper.")
+                   "(fixed to the soffit)." if e["kind"] == "wall" else "Set anchored=true (anchor bolts to the slab) or make it lower / deeper.")
             report["issues"].append({
                 "key": f"stability:{i}", "category": "physics", "severity": "fail",
                 "rule": "Lateral stability", "ref": f"MuJoCo tilt test {lateral_g} g", "element": i,

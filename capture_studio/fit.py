@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 
+import cv2
 import numpy as np
 import open3d as o3d
 from scipy import ndimage
@@ -107,10 +108,12 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     C *= scale
 
     def ceiling_of(P):
-        zz = P[(P[:, 2] > 1.9) & (P[:, 2] < 5.0), 2]
-        hist, edges = np.histogram(zz, bins=np.arange(1.9, 5.0, 0.02))
+        # highest strong horizontal layer above head height (a hall's roof deck sits above lights and cranes)
+        zz = P[(P[:, 2] > 1.9) & (P[:, 2] < 14.0), 2]
+        hist, edges = np.histogram(zz, bins=np.arange(1.9, 14.0, 0.04))
         hist = ndimage.gaussian_filter1d(hist.astype(float), 1.5)
-        return float(edges[int(np.argmax(hist))] + 0.01)
+        strong = np.flatnonzero(hist >= 0.35 * hist.max())
+        return float(edges[int(strong[-1])] + 0.02)
 
     ceil = ceiling_of(P)
     cal = SCAN / "calibration.json"
@@ -172,7 +175,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
         "cameras": [[round(float(v), 3) for v in (*C[i], *fwd[i])] for i in range(S)],
         "center": [round(float(ext[0] / 2), 2), round(float(ext[1] / 2), 2), 1.0],
         "radius": round(float(np.linalg.norm(ext) / 2), 2), "extent_m": [round(float(v), 2) for v in ext],
-        "ceiling_height": round(ceil, 3), "scale": round(scale, 5), "scale_source": source, "voxel_m": round(vox, 4),
+        "ceiling_height": round(ceil, 3), "view_clip": round(min(ceil - 0.2, 3.4), 2), "scale": round(scale, 5), "scale_source": source, "voxel_m": round(vox, 4),
         "inference_seconds": round(float(z["inference_seconds"]), 1),
     }
     (SCAN / "meta.json").write_text(json.dumps(meta))
@@ -217,7 +220,10 @@ def _faces(P, N, H, cell=0.05):
                 grid = np.zeros((int((u.max() - u0) / cell) + 1, int(H / 0.1) + 1), bool)
                 grid[((u - u0) / cell).astype(int), np.clip((zz / 0.1).astype(int), 0, grid.shape[1] - 1)] = True
                 covered = grid.sum(1) >= 4                       # at least 0.4 m of height has surface here
+                top = np.where(grid.any(1), grid.shape[1] - 1 - np.argmax(grid[:, ::-1], axis=1), 0) * 0.1
                 for i0, i1 in _runs(covered, int(0.5 / cell), int(0.25 / cell)):
+                    if np.median(top[i0:i1][covered[i0:i1]]) < min(H - 0.5, 2.6):
+                        continue                                 # stops well short of the ceiling: a machine or rack side
                     b0, b1 = u0 + i0 * cell, u0 + i1 * cell
                     mem = near & (P[:, b] >= b0) & (P[:, b] <= b1)
                     if mem.sum() < 300:
@@ -288,6 +294,57 @@ def _openings_on_face(face, P, Cp, H, cell=0.05):
     return out
 
 
+def _equipment(P, colors, walls, H, cell=0.05, max_items=40):
+    """Free-standing objects on the floor -> oriented boxes coloured from the scan."""
+    zmax = min(H - 0.4, 3.2)
+    m = (P[:, 2] > 0.25) & (P[:, 2] < zmax)
+    for w in walls:                                   # drop points belonging to walls
+        a = np.array(w["start"]); b = np.array(w["end"]); d = b - a; L2 = float(d @ d)
+        t = np.clip(((P[:, :2] - a) @ d) / L2, 0, 1)
+        m &= np.linalg.norm(P[:, :2] - (a + t[:, None] * d), axis=1) > w["thickness"] / 2 + 0.15
+    Q, C = P[m], colors[m]
+    if len(Q) < 500:
+        return []
+    lo = Q[:, :2].min(0)
+    ij = ((Q[:, :2] - lo) / cell).astype(int)
+    shape = ij.max(0) + 1
+    cnt = np.zeros(shape, np.int32)
+    np.add.at(cnt, (ij[:, 0], ij[:, 1]), 1)
+    occ = ndimage.binary_closing(cnt >= 3, structure=np.ones((5, 5)))
+    occ = ndimage.binary_opening(occ, structure=np.ones((3, 3)))
+    lab, n = ndimage.label(occ)
+    pl = lab[ij[:, 0], ij[:, 1]]
+    out = []
+    for k in range(1, n + 1):
+        sel = pl == k
+        if sel.sum() < 400:
+            continue
+        q = Q[sel]
+        h = float(np.percentile(q[:, 2], 97))
+        (cx, cy), (sx, sy), ang = cv2.minAreaRect(q[::max(1, len(q) // 5000), :2].astype(np.float32))
+        if sx * sy < 0.3 or h < 0.5 or min(sx, sy) < 0.3:
+            continue
+        if sx < sy:
+            sx, sy, ang = sy, sx, ang + 90
+        ang = ((ang + 90) % 180) - 90
+        snap = round(ang / 90) * 90
+        if abs(ang - snap) < 12:                      # most plant is set out square to the building
+            ang = snap
+            c, s_ = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+            u = (q[:, 0] - cx) * c + (q[:, 1] - cy) * s_
+            v = -(q[:, 0] - cx) * s_ + (q[:, 1] - cy) * c
+            (u0, u1), (v0, v1) = np.percentile(u, [1, 99]), np.percentile(v, [1, 99])
+            cx, cy = cx + (u0 + u1) / 2 * c - (v0 + v1) / 2 * s_, cy + (u0 + u1) / 2 * s_ + (v0 + v1) / 2 * c
+            sx, sy = u1 - u0, v1 - v0
+        col = np.median(C[sel], axis=0).astype(int)
+        cat = "rack" if h > 2.4 and sy < 1.4 else "bench" if h < 1.15 else "machine"
+        out.append({"pos": [round(float(cx), 2), round(float(cy), 2)], "size": [round(float(sx), 2), round(float(sy), 2), round(h, 2)],
+                    "yaw_deg": round(float(ang), 1), "category": cat, "points": int(sel.sum()),
+                    "color": "#%02x%02x%02x" % tuple(int(x) for x in col)})
+    out.sort(key=lambda e: -e["size"][0] * e["size"][1])
+    return out[:max_items]
+
+
 def fit_shell() -> tuple[dict, dict]:
     z = np.load(SCAN / "aligned.npz")
     P, frame, C, H = z["P"].astype(np.float64), z["frame"], z["C"].astype(np.float64), float(z["ceiling"])
@@ -316,7 +373,7 @@ def fit_shell() -> tuple[dict, dict]:
             walls.append([f, faces[best[0]]])
     walls += [[f] for i, f in enumerate(faces) if i not in used]
 
-    model = bim.empty_model("Gandhi Bazaar flat — main hall")
+    model = bim.empty_model("Scanned site")
     model["level"]["ceiling_height"] = round(H, 2)
     recs = []
     for fs in walls:
@@ -380,8 +437,17 @@ def fit_shell() -> tuple[dict, dict]:
         ex["name"] = "Entrance"
 
     ws = [e for e in model["elements"].values() if e["kind"] == "wall"]
-    xs = [p[0] for w in ws for p in (w["start"], w["end"])] + list(C[:, 0])
-    ys = [p[1] for w in ws for p in (w["start"], w["end"])] + list(C[:, 1])
+    cb = SCAN / "cloud.bin"
+    colors = (np.fromfile(cb, dtype=np.uint8)[len(P) * 12:].reshape(-1, 3) if cb.exists()
+              else np.full((len(P), 3), 150, np.uint8))
+    eq = _equipment(P, colors, ws, H)
+    names = {"machine": "Machine", "rack": "Rack", "bench": "Bench"}
+    for i, e in enumerate(eq):
+        n = sum(x["category"] == e["category"] for x in eq[:i]) + 1
+        bim.add(model, "equipment", "scanned", name=f"{names[e['category']]} {n}", material="racking" if e["category"] == "rack" else "machine",
+                anchored=True, fixed=True, **e)
+    xs = [p[0] for w in ws for p in (w["start"], w["end"])] + list(C[:, 0]) + [q[0] for e in eq for q in bim.footprint(model, {"kind": "equipment", **e})]
+    ys = [p[1] for w in ws for p in (w["start"], w["end"])] + list(C[:, 1]) + [q[1] for e in eq for q in bim.footprint(model, {"kind": "equipment", **e})]
     bim.add(model, "slab", "scanned", name="Floor slab", min=[round(min(xs) - 0.25, 2), round(min(ys) - 0.25, 2)],
             max=[round(max(xs) + 0.25, 2), round(max(ys) + 0.25, 2)], top=0.0, thickness=0.15, material="concrete")
 
