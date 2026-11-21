@@ -191,7 +191,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
         if o["kind"] not in bim.OPENING_KINDS:
             continue
         host = els[o["host"]]
-        if host.get("exterior") and o["kind"] in ("window", "void") and not o.get("exit") \
+        if not prof.get("industrial") and host.get("exterior") and o["kind"] in ("window", "void") and not o.get("exit") \
                 and o["sill"] < prof["guard_height"] - 0.1 and not o.get("guard"):
             issue(f"guard:{o['id']}", "safety", "warn", "Fall protection at low-sill opening", "guard", o["id"],
                   f"{o['name']} has a {o['sill']:.2f} m sill on an exterior wall — fall hazard during works.",

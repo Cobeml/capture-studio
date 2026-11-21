@@ -65,7 +65,8 @@ def find_ties(model: dict) -> dict[str, list[str]]:
     return ties
 
 
-def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None) -> tuple[str, dict]:
+def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None, isolate=False) -> tuple[str, dict]:
+    """isolate=True: proposed elements do not collide with each other (each is judged on its own)."""
     els = model["elements"]
     ties = find_ties(model)
     bodies, welds, excludes = [], [], []
@@ -79,8 +80,9 @@ def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None) -> t
         p = bim.pose(model, e)
         is_dyn = e["provenance"] == "proposed" and e["kind"] in DYNAMIC_KINDS
         dens = bim.density(model, e)
+        mask = ('contype="2" conaffinity="1" ' if is_dyn else 'contype="1" conaffinity="2" ') if isolate else ""
         geoms = "".join(
-            f'<geom type="box" pos="{b["c"][0]:.4f} {b["c"][1]:.4f} {b["c"][2]:.4f}" '
+            f'<geom type="box" {mask}pos="{b["c"][0]:.4f} {b["c"][1]:.4f} {b["c"][2]:.4f}" '
             f'size="{b["s"][0] / 2:.4f} {b["s"][1] / 2:.4f} {b["s"][2] / 2:.4f}" density="{dens}"/>'
             for b in boxes)
         joint = "<freejoint/>" if is_dyn else ""
@@ -103,7 +105,7 @@ def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None) -> t
         bodies.append(f'<body name="drop{i}" pos="{x:.3f} {y:.3f} {z:.3f}"><freejoint/>'
                       f'<geom type="box" size="0.15 0.15 0.15" density="400"/></body>')
     xml = f"""<mujoco model="capture_studio">
-  <option timestep="0.002" gravity="0 0 -{G}" integrator="implicitfast"/>
+  <option timestep="0.002" gravity="0 0 -{G}" integrator="implicitfast" cone="elliptic" impratio="10" noslip_iterations="4"/>
   <default><geom friction="0.6 0.005 0.0001" solref="0.004 1"/></default>
   <worldbody>{''.join(bodies)}</worldbody>
   <contact>{''.join(dict.fromkeys(excludes))}</contact>
@@ -204,7 +206,7 @@ def run(model: dict, lateral_g: float | None = None, erection_g=0.05) -> dict:
     worst, tie_peak, frames = _tilt_test(m, d, ids, lateral_g, 1.6, record=True)
 
     # erection state: no ties
-    xml2, _ = build_mjcf(model, with_ties=False)
+    xml2, _ = build_mjcf(model, with_ties=False, isolate=True)
     m2 = mujoco.MjModel.from_xml_string(xml2)
     d2 = mujoco.MjData(m2)
     for _ in range(500):

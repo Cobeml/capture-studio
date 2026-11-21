@@ -1,45 +1,121 @@
 // Capture Studio demo viewer: video -> point cloud -> BIM -> agentic design. Reads everything from the MCP server's state.
+// Every animation is a function of clock(). With ?capture=1 the clock is virtual and advanced by window.__demo.frame(ms)
+// (scripts/record_demo.py steps it at 30 fps and screenshots each frame), otherwise it is performance.now().
 import * as THREE from 'three';
 import { OrbitControls } from '/web/vendor/OrbitControls.js';
 
 const $ = (s) => document.querySelector(s);
-const ACCENT = 0xff8a3d, BAD = 0xff5a5f;
+const CAPTURE = new URLSearchParams(location.search).has('capture');
+let vnow = 0;
+const clock = () => (CAPTURE ? vnow : performance.now());
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const ease = (x) => { x = clamp(x); return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const easeOut = (x) => 1 - Math.pow(1 - clamp(x), 3);
+const easeBack = (x) => { x = clamp(x); const c = 1.5; return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+const span = (t, a, b) => clamp((t - a) / (b - a));
+const fmt = (n) => Math.round(n).toLocaleString('en-US');
+
+const ACCENT = 0xff8a3d, BAD = 0xff5a5f, OK = 0x3ddc97;
 const USE_COLOR = { living: 0x4c9aff, bedroom: 0x9b7bff, office: 0x3ddc97, study: 0x3ddc97, dining: 0x4c9aff,
-  kitchen: 0xffc857, bathroom: 0x5ad1e6, store: 0x8a93a0, corridor: 0x8a93a0 };
+  kitchen: 0xffc857, bathroom: 0x5ad1e6, store: 0x8a93a0, corridor: 0x8a93a0, workshop: 0xffc857, production: 0xffc857,
+  storage: 0x8a93a0, warehouse: 0x8a93a0 };
+const SCAN_MS = 6000, CLOUD_TARGET_MS = 14000, CLOUD_HOLD_MS = 2800, BIM_MS = 11000;
+const CUT = 1.2, CUT_TALL = 2.2;               // design-stage cutaway heights: walls/openings, equipment/other
+const CUT_KINDS = new Set(['wall', 'door', 'window', 'column', 'opening']);
 
 // ---------------------------------------------------------------- three setup (Z up, metres)
 const renderer = new THREE.WebGLRenderer({ canvas: $('#gl'), antialias: true, preserveDrawingBuffer: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(CAPTURE ? 1 : Math.min(devicePixelRatio, 2));
 renderer.localClippingEnabled = true;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
-const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 400);
+const camera = new THREE.PerspectiveCamera(40, 1, 0.05, 2000);
 camera.up.set(0, 0, 1);
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true; controls.maxPolarAngle = Math.PI * 0.49; controls.autoRotateSpeed = 0.9;
-scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.5));
-const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(6, -9, 14); scene.add(sun);
-const grid = new THREE.GridHelper(60, 60, 0x1c2128, 0x151a20); grid.rotation.x = Math.PI / 2; grid.position.z = -0.32; scene.add(grid);
-const clipCeiling = new THREE.Plane(new THREE.Vector3(0, 0, -1), 2.6);
+controls.enableDamping = true; controls.maxPolarAngle = Math.PI * 0.49;
+let manual = false;
+controls.addEventListener('start', () => (manual = true));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7); sun.position.set(6, -9, 14); scene.add(sun);
+const fill = new THREE.DirectionalLight(0x9fb4d0, 0.5); fill.position.set(-8, 7, 5); scene.add(fill);
+let grid = null;
 
 const world = new THREE.Group(); scene.add(world);        // BIM elements
 const overlay = new THREE.Group(); scene.add(overlay);    // egress paths etc.
-let cloud = null, meta = null, camMarker = null, pathLine = null;
-let center = new THREE.Vector3(4, 3, 1), radius = 9;
+const NOCLIP = () => new THREE.Plane(new THREE.Vector3(0, 0, 1), 1e6);
+const wipePlane = NOCLIP();                                // model side of the scan|model compare wipe
+let cloud = null, cloudU = null, meta = null, frustum = null, pathLine = null;
+const sceneC = new THREE.Vector3(4, 3, 1); let sceneR = 9, ceiling = 2.9, cloudC = null, cloudR = null;
 
-function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+function resize() {
+  renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  if (cloudU) cloudU.uScale.value = renderer.domElement.height / 2 / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+}
 addEventListener('resize', resize); resize();
 
-function frameCamera(az = -0.9, el = 0.82, k = 1.55, instant = false) {
-  const d = radius * k;
-  const to = new THREE.Vector3(center.x + d * Math.cos(el) * Math.cos(az), center.y + d * Math.cos(el) * Math.sin(az), center.z + d * Math.sin(el));
-  camGoal = { pos: to, t: instant ? 1 : 0, from: camera.position.clone() };
-  controls.target.copy(center);
-  if (instant) camera.position.copy(to);
-}
-let camGoal = null;
+// ---------------------------------------------------------------- camera director (target + azimuth/elevation/distance)
+const cam = { target: new THREE.Vector3(), az: -0.9, el: 0.9, dist: 20 };
+let camFrom = null, camAt = 0, camShot = null, focus = { c: null, w: 0, goal: 0 };
+const fitDist = (R) => { const v = THREE.MathUtils.degToRad(camera.fov) / 2, h = Math.atan(Math.tan(v) * camera.aspect); return R / Math.sin(Math.min(v, h)); };
+const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
-// ---------------------------------------------------------------- point cloud
+function shot(t) {          // camera for the current stage at stage time t (ms)
+  const s = t / 1000;
+  if (stage === 'scan' || stage === 'cloud') {
+    const C = cloudC ?? sceneC, R = cloudR ?? sceneR;
+    return { target: C, az: -0.9 + (stage === 'cloud' ? s * 0.055 : 0), el: 0.92 - (stage === 'cloud' ? Math.min(s, 16) * 0.012 : 0), dist: fitDist(R) * (1.0 - (stage === 'cloud' ? Math.min(s, 16) * 0.006 : 0)) };
+  }
+  if (stage === 'bim') return { target: sceneC, az: camShot.az0 + s * 0.05, el: 0.8, dist: fitDist(sceneR) * 0.95 };
+  // design: higher, slow drift, gentle push towards what the agent just touched
+  const w = focus.w, tgt = sceneC.clone();
+  if (focus.c && w > 0) tgt.lerp(focus.c, 0.4 * w);
+  return { target: tgt, az: camShot.az0 + s * 0.012, el: 0.95, dist: fitDist(sceneR) * (0.98 - 0.12 * w) };
+}
+
+function camStage() { camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = clock(); camShot = { az0: cam.az }; manual = false; }
+
+function updateCamera(now) {
+  if (manual) { controls.update(); return; }
+  const g = shot(now - stageAt);
+  const k = camFrom ? ease((now - camAt) / 1900) : 1;
+  if (camFrom) {
+    cam.target.lerpVectors(camFrom.target, g.target, k);
+    cam.az = camFrom.az + wrap(g.az - camFrom.az) * k; cam.el = camFrom.el + (g.el - camFrom.el) * k; cam.dist = camFrom.dist + (g.dist - camFrom.dist) * k;
+    if (k >= 1) camFrom = null;
+  } else { cam.target.copy(g.target); cam.az = g.az; cam.el = g.el; cam.dist = g.dist; }
+  const { target: c, az, el, dist: d } = cam;
+  camera.position.set(c.x + d * Math.cos(el) * Math.cos(az), c.y + d * Math.cos(el) * Math.sin(az), c.z + d * Math.sin(el));
+  camera.lookAt(c); controls.target.copy(c);
+}
+
+// ---------------------------------------------------------------- point cloud (custom shader: capture-order reveal + fresh-point glow)
+const CLOUD_VS = `
+#include <common>
+#include <clipping_planes_pars_vertex>
+uniform float uReveal, uFresh, uSize, uScale; uniform vec3 uHi; uniform vec4 uWipe;
+varying vec3 vColor; varying float vSide;
+void main() {
+  float id = float(gl_VertexID);
+  if (id >= uReveal) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vec4 mvPosition = viewMatrix * wp;
+  float fresh = 1.0 - smoothstep(0.0, 1.0, (uReveal - id) / max(uFresh, 1.0));
+  vColor = mix(color, uHi, fresh * 0.8);
+  vSide = dot(uWipe.xyz, wp.xyz) + uWipe.w;
+  gl_PointSize = max(1.5, uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6));
+  gl_Position = projectionMatrix * mvPosition;
+  #include <clipping_planes_vertex>
+}`;
+const CLOUD_FS = `
+#include <clipping_planes_pars_fragment>
+uniform float uOpScan, uOpModel; varying vec3 vColor; varying float vSide;
+void main() {
+  #include <clipping_planes_fragment>
+  vec2 c = gl_PointCoord - 0.5; if (dot(c, c) > 0.25) discard;
+  gl_FragColor = vec4(vColor, vSide < 0.0 ? uOpScan : uOpModel);
+}`;
+const clipCeiling = new THREE.Plane(new THREE.Vector3(0, 0, -1), 2.7);
+
 async function loadCloud() {
   const m = await fetch('/data/scan/meta.json'); if (!m.ok) return;
   meta = await m.json();
@@ -48,185 +124,362 @@ async function loadCloud() {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
-  cloud = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.028, vertexColors: true, transparent: true, clippingPlanes: [clipCeiling], depthWrite: true }));
-  cloud.visible = false; scene.add(cloud);
-  center.set(...meta.center); radius = meta.radius;
-  clipCeiling.constant = meta.ceiling_height - 0.2;
-  // moving phone marker + path
-  camMarker = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.26, 4), new THREE.MeshBasicMaterial({ color: ACCENT }));
-  camMarker.visible = false; scene.add(camMarker);
-  const pg = new THREE.BufferGeometry().setFromPoints(meta.cameras.map((c) => new THREE.Vector3(c[0], c[1], c[2])));
-  pathLine = new THREE.Line(pg, new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.8 }));
-  pathLine.visible = false; scene.add(pathLine);
-  frameCamera(-0.9, 0.95, 2.5, true);
+  cloudU = { uReveal: { value: n }, uFresh: { value: n / Math.max(1, meta.frames) }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 },
+    uScale: { value: 500 }, uHi: { value: new THREE.Color(1.0, 0.62, 0.32) }, uWipe: { value: new THREE.Vector4(0, 0, 0, 1) },
+    uOpScan: { value: 1 }, uOpModel: { value: 1 } };
+  cloud = new THREE.Points(g, new THREE.ShaderMaterial({ uniforms: cloudU, vertexShader: CLOUD_VS, fragmentShader: CLOUD_FS, vertexColors: true,
+    transparent: true, depthWrite: true, clipping: true, clippingPlanes: [clipCeiling] }));
+  cloud.frustumCulled = false; cloud.visible = false; scene.add(cloud);
+  ceiling = meta.ceiling_height ?? ceiling;
+  cloudC = new THREE.Vector3(meta.center[0], meta.center[1], Math.min(meta.center[2], ceiling * 0.35));
+  cloudR = Math.hypot(meta.radius, ceiling / 2);
+  sceneC.copy(cloudC); sceneR = cloudR;
+  clipCeiling.constant = ceiling - 0.2;
+  // phone frustum + captured path
+  const sz = clamp(meta.radius * 0.085, 0.3, 1.4), w = sz * 0.75, h = sz * 0.45;
+  const P = [[0, 0, 0], [-w, sz, -h], [w, sz, -h], [w, sz, h], [-w, sz, h]].map((p) => new THREE.Vector3(...p));
+  const segs = [0, 1, 0, 2, 0, 3, 0, 4, 1, 2, 2, 3, 3, 4, 4, 1].map((i) => P[i]);
+  frustum = new THREE.Group();
+  frustum.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(segs), new THREE.LineBasicMaterial({ color: ACCENT })));
+  const face = new THREE.BufferGeometry().setFromPoints([P[1], P[2], P[3], P[1], P[3], P[4]]);
+  frustum.add(new THREE.Mesh(face, new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false })));
+  const glow = new THREE.Mesh(new THREE.SphereGeometry(sz * 0.12, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  frustum.add(glow);
+  frustum.visible = false; scene.add(frustum);
+  pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.85 }));
+  pathLine.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array((meta.frames + 1) * 3), 3));
+  pathLine.visible = false; pathLine.frustumCulled = false; scene.add(pathLine);
+  buildGrid();
 }
 
-function revealTo(frame) {
-  if (!cloud) return;
-  const f = Math.max(0, Math.min(meta.frames, Math.floor(frame)));
-  cloud.geometry.setDrawRange(0, meta.frame_offsets[f]);
-  pathLine.geometry.setDrawRange(0, Math.max(2, f));
-  const c = meta.cameras[Math.min(f, meta.frames - 1)];
-  camMarker.position.set(c[0], c[1], c[2]);
-  camMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(c[3], c[4], c[5]).normalize());
+function buildGrid() {
+  if (grid) scene.remove(grid);
+  const size = Math.max(20, Math.ceil(sceneR * 6 / 5) * 5);
+  grid = new THREE.GridHelper(size, size, 0x1c2128, 0x14181e); grid.rotation.x = Math.PI / 2;
+  grid.position.set(Math.round(sceneC.x), Math.round(sceneC.y), -0.3); scene.add(grid);
+}
+
+const camAtFrame = (f) => {     // interpolated phone pose at fractional frame f
+  const C = meta.cameras, i = clamp(Math.floor(f), 0, C.length - 1), j = Math.min(i + 1, C.length - 1), k = clamp(f - i);
+  const a = C[i], b = C[j];
+  return { p: new THREE.Vector3(a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k),
+    f: new THREE.Vector3(a[3] + (b[3] - a[3]) * k, a[4] + (b[4] - a[4]) * k, a[5] + (b[5] - a[5]) * k).normalize() };
+};
+
+function revealTo(frame) {      // fractional frame: points revealed in capture order, synced to the inset video
+  if (!cloud) return 0;
+  const F = meta.frames, O = meta.frame_offsets, f = clamp(frame, 0, F);
+  const i = Math.min(Math.floor(f), F - 1), k = f >= F ? 1 : f - i;
+  const o1 = O[i + 1] ?? meta.n, n = f >= F ? meta.n : O[i] + (o1 - O[i]) * k;
+  cloudU.uReveal.value = n;
+  cloudU.uFresh.value = Math.max(2000, (o1 - O[i]) * 0.9);
+  cloud.geometry.setDrawRange(0, Math.ceil(n));
+  // path up to the current pose + frustum
+  const now = camAtFrame(Math.min(f, F - 1)), arr = pathLine.geometry.attributes.position.array;
+  const m = Math.min(Math.floor(f), F - 1);
+  for (let j = 0; j <= m; j++) { const c = meta.cameras[j]; arr.set([c[0], c[1], c[2]], j * 3); }
+  arr.set([now.p.x, now.p.y, now.p.z], (m + 1) * 3);
+  pathLine.geometry.attributes.position.needsUpdate = true; pathLine.geometry.setDrawRange(0, m + 2);
+  const r = new THREE.Vector3().crossVectors(now.f, new THREE.Vector3(0, 0, 1));
+  if (r.lengthSq() < 1e-6) r.set(1, 0, 0); r.normalize();
+  const u = new THREE.Vector3().crossVectors(r, now.f).normalize();
+  frustum.position.copy(now.p); frustum.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(r, now.f, u));
+  return n;
 }
 
 // ---------------------------------------------------------------- BIM elements
-const groups = new Map();   // id -> { group, key, born, el }
-const edgeMat = (c, o = 0.9) => new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: o });
+const groups = new Map();   // id -> rec
+const edgeMat = (c, o = 0.9) => new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: o, clippingPlanes: [wipePlane] });
+const hex = (s, d) => { try { return s ? new THREE.Color(s) : new THREE.Color(d); } catch { return new THREE.Color(d); } };
+
+function elementMaterial(e) {
+  const proposed = e.provenance === 'proposed', c = hex(e.color, 0x9aa0a6), clip = [wipePlane];
+  if (e.kind === 'window') return new THREE.MeshStandardMaterial({ color: proposed ? 0xffc9a0 : 0x9fd3e6, transparent: true, opacity: 0.38, roughness: 0.1, depthWrite: false, clippingPlanes: clip });
+  if (e.kind === 'door') return new THREE.MeshStandardMaterial({ color: proposed ? ACCENT : c, transparent: true, opacity: 0.7, roughness: 0.7, clippingPlanes: clip });
+  if (e.kind === 'slab') return new THREE.MeshStandardMaterial({ color: c.multiplyScalar(0.42), roughness: 0.95, clippingPlanes: clip });
+  if (proposed) return new THREE.MeshStandardMaterial({ color: 0xffb37e, roughness: 0.75, emissive: ACCENT, emissiveIntensity: 0.2, clippingPlanes: clip });
+  return new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: e.kind === 'equipment' ? 0.15 : 0, emissive: 0x000000, clippingPlanes: clip });
+}
 
 function buildElement(e) {
   const g = new THREE.Group();
   g.position.set(...e.pose.pos); g.rotation.z = e.pose.yaw;
   const proposed = e.provenance === 'proposed';
-  if (e.kind === 'space') {
+  const parts = [];
+  if (e.kind === 'space' && e.polygon?.length > 2) {
+    const col = USE_COLOR[e.use] ?? 0x8a93a0;
     const shape = new THREE.Shape(e.polygon.map((p) => new THREE.Vector2(p[0], p[1])));
-    const mesh = new THREE.Mesh(new THREE.ShapeGeometry(shape), new THREE.MeshBasicMaterial({ color: USE_COLOR[e.use] ?? 0x8a93a0, transparent: true, opacity: 0.26, depthWrite: false, side: THREE.DoubleSide }));
-    mesh.position.z = 0.015; g.add(mesh);
-    const pts = e.polygon.map((p) => new THREE.Vector3(p[0], p[1], 0.02)); pts.push(pts[0]);
-    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), edgeMat(USE_COLOR[e.use] ?? 0x8a93a0, 0.9)));
-    return g;
+    const mat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.3, depthWrite: false, side: THREE.DoubleSide, clippingPlanes: [wipePlane] });
+    const mesh = new THREE.Mesh(new THREE.ShapeGeometry(shape), mat); mesh.position.z = 0.02; mesh.userData.id = e.id; mesh.renderOrder = 1; g.add(mesh);
+    const pts = e.polygon.map((p) => new THREE.Vector3(p[0], p[1], 0.03)); pts.push(pts[0]);
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), edgeMat(col, 0.95)));
+    return { g, parts, fades: [[mat, 0.3]] };
   }
-  for (const b of e.boxes) {
-    const geo = new THREE.BoxGeometry(...b.s);
-    let mat;
-    if (e.kind === 'window') mat = new THREE.MeshStandardMaterial({ color: 0x9fd3e6, transparent: true, opacity: 0.35, roughness: 0.1 });
-    else if (e.kind === 'door') mat = new THREE.MeshStandardMaterial({ color: proposed ? ACCENT : 0x9a7b5a, transparent: true, opacity: 0.55 });
-    else if (e.kind === 'slab') mat = new THREE.MeshStandardMaterial({ color: 0x3a3f47, roughness: 0.95 });
-    else mat = new THREE.MeshStandardMaterial({ color: proposed ? 0xffb37e : 0xd9dde2, roughness: 0.85, transparent: !proposed, opacity: proposed ? 1 : 0.78,
-      emissive: proposed ? ACCENT : 0x000000, emissiveIntensity: proposed ? 0.18 : 0 });
-    const mesh = new THREE.Mesh(geo, mat); mesh.position.set(...b.c); mesh.userData.id = e.id; g.add(mesh);
-    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat(proposed ? ACCENT : 0x6b7480, proposed ? 1 : 0.55));
-    edges.position.copy(mesh.position); g.add(edges);
+  const cutH = CUT_KINDS.has(e.kind) ? CUT : CUT_TALL;
+  for (const b of e.boxes ?? []) {
+    const geo = new THREE.BoxGeometry(...b.s), bg = new THREE.Group();
+    bg.position.set(b.c[0], b.c[1], b.c[2]);
+    const mesh = new THREE.Mesh(geo, elementMaterial(e)); mesh.userData.id = e.id; bg.add(mesh);
+    if (e.kind !== 'slab') bg.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat(proposed ? ACCENT : 0x2b3038, proposed ? 1 : 0.6)));
+    g.add(bg);
+    parts.push({ bg, bottom: b.c[2] - b.s[2] / 2, h: b.s[2], z0: e.pose.pos[2], cut: proposed || e.kind === 'slab' ? null : cutH });
   }
-  return g;
+  return { g, parts, fades: [] };
 }
 
-function applyModel(model, { animate = false, stagger = 0, flag = [], flagColor = ACCENT } = {}) {
-  const now = performance.now(); let i = 0;
-  const seen = new Set();
-  for (const e of Object.values(model.elements)) {
+function elementBox(e, box = new THREE.Box3()) {
+  const [x, y, z] = e.pose.pos, c = Math.cos(e.pose.yaw), s = Math.sin(e.pose.yaw);
+  if (e.kind === 'space' && e.polygon) { for (const p of e.polygon) box.expandByPoint(new THREE.Vector3(x + c * p[0] - s * p[1], y + s * p[0] + c * p[1], z)); return box; }
+  for (const b of e.boxes ?? []) for (const dx of [-1, 1]) for (const dy of [-1, 1]) for (const dz of [-1, 1]) {
+    const lx = b.c[0] + dx * b.s[0] / 2, ly = b.c[1] + dy * b.s[1] / 2;
+    box.expandByPoint(new THREE.Vector3(x + c * lx - s * ly, y + s * lx + c * ly, z + b.c[2] + dz * b.s[2] / 2));
+  }
+  return box;
+}
+
+function frameModel(model) {   // scene bounds from slab/walls/equipment, else the cloud
+  const box = new THREE.Box3();
+  for (const e of Object.values(model.elements)) if (e.kind !== 'space') elementBox(e, box);
+  if (box.isEmpty()) return;
+  box.getCenter(sceneC); const sz = box.getSize(new THREE.Vector3());
+  sceneC.z = Math.min(sceneC.z, ceiling * 0.35);
+  sceneR = Math.max(1.5, Math.hypot(sz.x, sz.y) / 2, sz.z / 2) * 1.02;
+  ceiling = model.level?.ceiling_height ?? ceiling; clipCeiling.constant = ceiling - 0.2;
+  buildGrid();
+}
+
+function applyModel(model, { animate = false, stagger = 0, flag = [], flagColor = ACCENT, order = null } = {}) {
+  const now = clock(); const seen = new Set(); let i = 0;
+  const els = Object.values(model.elements);
+  if (order) els.sort(order);
+  const fresh = els.filter((e) => { const old = groups.get(e.id); return !old || old.key !== JSON.stringify(e); }).length;
+  for (const e of els) {
     seen.add(e.id);
     const key = JSON.stringify(e), old = groups.get(e.id);
     if (old && old.key === key) { setFlag(old, flag.includes(e.id) ? flagColor : null); continue; }
     if (old) world.remove(old.group);
-    const group = buildElement(e);
-    const rec = { group, key, el: e, born: animate ? now + (stagger ? i++ * stagger : 0) : 0, base: group.position.clone(), baseQ: group.quaternion.clone() };
-    if (animate && e.kind !== 'space') group.scale.z = 0.001;
-    world.add(group); groups.set(e.id, rec);
+    const { g, parts, fades } = buildElement(e);
+    const delay = animate && stagger ? (i++ / Math.max(1, fresh - 1)) * stagger : 0;
+    const rec = { group: g, parts, fades, key, el: e, born: animate ? now + delay : 0, pop: animate && e.provenance === 'proposed',
+      base: g.position.clone(), baseQ: g.quaternion.clone() };
+    world.add(g); groups.set(e.id, rec);
     setFlag(rec, flag.includes(e.id) ? flagColor : null);
+    updateElement(rec, now);
   }
   for (const [id, rec] of groups) if (!seen.has(id)) { world.remove(rec.group); groups.delete(id); }
-  clipCeiling.constant = (model.level.ceiling_height ?? 2.9) - 0.2;
   $('#rev').textContent = model.revision ? 'R' + model.revision : '';
   buildLabels(model);
 }
 
-function setFlag(rec, color) {
-  rec.group.traverse((o) => {
-    if (o.isLineSegments) { o.material.color.setHex(color ?? (rec.el.provenance === 'proposed' ? ACCENT : 0x6b7480)); o.material.opacity = color ? 1 : (rec.el.provenance === 'proposed' ? 1 : 0.55); }
-    if (o.isMesh && o.material.emissive && rec.el.kind !== 'slab') { o.material.emissive.setHex(color ?? (rec.el.provenance === 'proposed' ? ACCENT : 0)); o.material.emissiveIntensity = color === BAD ? 0.7 : (rec.el.provenance === 'proposed' ? 0.18 : 0); }
-  });
-}
-
-let labels = [];
-function buildLabels(model) {
-  $('#labels').innerHTML = ''; labels = [];
-  for (const e of Object.values(model.elements)) if (e.kind === 'space') {
-    const cx = e.polygon.reduce((a, p) => a + p[0], 0) / e.polygon.length, cy = e.polygon.reduce((a, p) => a + p[1], 0) / e.polygon.length;
-    let a = 0; e.polygon.forEach((p, i) => { const q = e.polygon[(i + 1) % e.polygon.length]; a += p[0] * q[1] - q[0] * p[1]; });
-    const d = document.createElement('div'); d.className = 'label'; d.innerHTML = `${e.name}<small>${Math.abs(a / 2).toFixed(1)} m²</small>`;
-    $('#labels').appendChild(d); labels.push({ d, v: new THREE.Vector3(cx, cy, 0.05) });
+let cutNow = Infinity;
+function updateElement(r, now) {
+  let k = 1;
+  if (r.born) { k = clamp((now - r.born) / (r.pop ? 650 : 750)); if (now >= r.born + 2000) r.born = 0; }
+  const rise = r.born ? (r.pop ? easeBack(k) : easeOut(k)) : 1;
+  for (const [m, o] of r.fades) m.opacity = o * clamp(k);
+  for (const p of r.parts) {
+    let h = p.h;
+    if (p.cut != null && cutNow < 1e5) h = clamp(Math.max(cutNow, p.cut) - p.z0 - p.bottom, 0, p.h);
+    h *= Math.max(0.001, rise);
+    p.bg.visible = h > 0.002;
+    p.bg.scale.z = Math.max(0.001, h / p.h); p.bg.position.z = p.bottom + h / 2;
   }
 }
 
+function setFlag(rec, color) {
+  const proposed = rec.el.provenance === 'proposed';
+  rec.group.traverse((o) => {
+    if (o.isLineSegments) { o.material.color.setHex(color ?? (proposed ? ACCENT : 0x2b3038)); o.material.opacity = color ? 1 : (proposed ? 1 : 0.6); }
+    if (o.isMesh && o.material.emissive && rec.el.kind !== 'slab') {
+      o.material.emissive.setHex(color ?? (proposed ? ACCENT : 0)); o.material.emissiveIntensity = color === BAD ? 0.75 : color ? 0.45 : (proposed ? 0.2 : 0);
+    }
+  });
+}
+
+let labels = [], labelKey = '';
+function buildLabels(model) {
+  const sp = Object.values(model.elements).filter((e) => e.kind === 'space' && e.polygon?.length > 2);
+  const key = JSON.stringify(sp.map((e) => [e.id, e.name, e.polygon]));
+  if (key === labelKey) return; labelKey = key;
+  $('#labels').innerHTML = ''; labels = [];
+  for (const e of sp) {
+    const cx = e.polygon.reduce((a, p) => a + p[0], 0) / e.polygon.length, cy = e.polygon.reduce((a, p) => a + p[1], 0) / e.polygon.length;
+    let a = 0; e.polygon.forEach((p, i) => { const q = e.polygon[(i + 1) % e.polygon.length]; a += p[0] * q[1] - q[0] * p[1]; });
+    const d = document.createElement('div'); d.className = 'label'; d.innerHTML = `${esc(e.name)}<small>${Math.abs(a / 2).toFixed(1)} m²</small>`;
+    $('#labels').appendChild(d); labels.push({ d, v: new THREE.Vector3(cx + e.pose.pos[0], cy + e.pose.pos[1], 0.05) });
+  }
+}
+
+let egressKey = '', egressAt = 0;
 function drawEgress(v) {
+  const key = JSON.stringify(v?.egress?.paths ?? null);
+  if (key === egressKey) return; egressKey = key; egressAt = clock();
   overlay.clear();
   if (!v?.egress?.paths) return;
   for (const p of Object.values(v.egress.paths)) {
-    if (!p) continue;
-    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(p.points.map((q) => new THREE.Vector3(q[0], q[1], 0.06))),
-      new THREE.LineDashedMaterial({ color: 0x3ddc97, dashSize: 0.18, gapSize: 0.12 }));
-    line.computeLineDistances(); overlay.add(line);
+    if (!p?.points?.length) continue;
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(p.points.map((q) => new THREE.Vector3(q[0], q[1], 0.08))),
+      new THREE.LineDashedMaterial({ color: OK, dashSize: 0.2, gapSize: 0.12 }));
+    line.computeLineDistances(); line.geometry.setDrawRange(0, 0); line.userData.n = p.points.length; overlay.add(line);
+    const end = p.points.at(-1);
+    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.14, 24), new THREE.MeshBasicMaterial({ color: OK, transparent: true, opacity: 0 }));
+    dot.position.set(end[0], end[1], 0.09); dot.userData.dot = true; overlay.add(dot);
+  }
+}
+function updateEgress(now) {
+  const k = easeOut((now - egressAt) / 1600);
+  for (const o of overlay.children) {
+    if (o.userData.n) o.geometry.setDrawRange(0, Math.ceil(o.userData.n * k));
+    if (o.userData.dot) o.material.opacity = span(now - egressAt, 1300, 1700);
   }
 }
 
 // ---------------------------------------------------------------- UI: pills, side cards, caption
 function pills(v) {
-  const set = (id, ok, hold) => { $(id).className = 'pill ' + (ok == null ? '' : ok ? 'ok' : hold ? 'hold' : 'bad'); };
+  const set = (id, ok, hold) => {
+    const c = 'pill ' + (ok == null ? '' : ok ? 'ok' : hold ? 'hold' : 'bad'), el = $(id);
+    if (el.dataset.c !== c) { el.dataset.c = c; el.className = c; if (ok != null) { void el.offsetWidth; el.classList.add('flip'); } }
+  };
   set('#p-code', v?.code_ok); set('#p-physics', v?.physics_ok);
-  set('#p-safety', v?.safety_ok, v && !v.safety_ok && v.counts?.hold > 0 && true);
+  set('#p-safety', v?.safety_ok, v && !v.safety_ok && v.counts?.hold > 0);
   set('#p-wishes', v ? v.desires_ok : null, true);
 }
 
 function side(S, live) {
   let h = '';
-  if (S.requirements.length) h += `<div class="card"><h4>Wishes</h4>${S.requirements.map((r) => `<div class="row ${r.status}"><b></b>${esc(r.text)}</div>`).join('')}</div>`;
+  if (S.requirements.length) h += `<div class="card"><h4>Wishes</h4>${S.requirements.slice(0, 5).map((r) => `<div class="row ${r.status}"><b></b>${esc(r.text)}</div>`).join('')}</div>`;
   const iss = live ? (S.validation?.issues ?? []) : [];
-  const open = iss.filter((i) => i.severity !== 'warn'), warn = iss.filter((i) => i.severity === 'warn');
-  if (open.length) h += `<div class="card"><h4>To resolve</h4>${open.slice(0, 6).map((i) => `<div class="row ${i.severity}"><b></b>${esc(i.rule)}<small>${esc(i.category)}</small></div>`).join('')}</div>`;
-  if (live && S.next_steps.length) h += `<div class="card"><h4>Next steps</h4><ol class="steps">${S.next_steps.map((s) => `<li>${esc(s.title)} <small>· ${esc(s.who)}</small></li>`).join('')}</ol></div>`;
-  else if (warn.length) h += `<div class="card"><h4>On site</h4>${warn.slice(0, 4).map((i) => `<div class="row warn"><b></b>${esc(i.rule)}</div>`).join('')}</div>`;
-  $('#side').innerHTML = h;
+  const open = iss.filter((i) => i.severity !== 'warn');
+  if (open.length) h += `<div class="card"><h4>To resolve</h4>${open.slice(0, 4).map((i) => `<div class="row ${i.severity}"><b></b>${esc(i.rule)}<small>${esc(i.category)}</small></div>`).join('')}</div>`;
+  if (live && S.next_steps.length) h += `<div class="card"><h4>Next steps</h4><ol class="steps">${S.next_steps.slice(0, 5).map((s) => `<li>${esc(s.title)} <small>· ${esc(s.who)}</small></li>`).join('')}</ol></div>`;
+  if ($('#side').dataset.h !== h) { $('#side').dataset.h = h; $('#side').innerHTML = h; }
   const q = S.questions.find((x) => x.answer == null);
-  $('#q').style.display = q ? 'block' : 'none';
+  $('#q').classList.toggle('show', !!q);
+  if (!q) $('#q').dataset.id = '';
   if (q && $('#q').dataset.id !== q.id) {
     $('#q').dataset.id = q.id; $('#q p').textContent = q.question; $('#q div').innerHTML = '';
-    for (const o of q.options) { const b = document.createElement('button'); b.textContent = o; b.onclick = () => post('/api/answer', { id: q.id, answer: o }); $('#q div').appendChild(b); }
+    for (const o of q.options) {
+      const b = document.createElement('button'); b.textContent = o;
+      b.onclick = () => { b.classList.add('hit'); toast('Answered: ' + o, true); post('/api/answer', { id: q.id, answer: o }); };
+      $('#q div').appendChild(b);
+    }
   }
 }
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then(poll);
-const caption = (t) => { $('#caption').textContent = t || ''; };
+const TAGS = { scan: '01 Video', cloud: '02 Point cloud', bim: '03 BIM', design: '04 Agentic design' };
+function caption(t) {
+  $('#tag').textContent = TAGS[stage];
+  const s = $('#caption span'); if (s.textContent === (t || '')) return;
+  s.textContent = t || ''; s.classList.remove('fresh'); void s.offsetWidth; s.classList.add('fresh');
+}
+let toastUntil = 0;
+function toast(t, ok = false) { $('#sent').textContent = t; $('#sent').className = ok ? 'ok' : ''; toastUntil = clock() + 2600; }
 
 // ---------------------------------------------------------------- stages + replay
 let S = null, stage = 'scan', queue = [], shown = 0, busyUntil = 0, anim = null, autoplay = false, stageAt = 0, selected = null;
+let revealDoneAt = 0, liveAt = 0, cloudRate = 1, base = null, baseIdx = 0, evMs = 1100;
 const video = $('#video');
+const vdur = () => (isFinite(video.duration) && video.duration > 0 ? video.duration : meta ? meta.frames / meta.fps : 10);
+
+function baseline() {      // the as-built model the design starts from: last fit_bim event (else first event, else live model)
+  const H = S?.history ?? [];
+  let i = -1; H.forEach((h, j) => { if (h.action === 'fit_bim') i = j; });
+  if (i < 0 && H.length) i = 0;
+  baseIdx = i; return i >= 0 ? H[i].model : S?.model;
+}
+const KIND_RANK = { slab: 0, wall: 1, column: 2, door: 3, window: 3, opening: 3, equipment: 4 };
+const count = (m) => Object.values(m.elements).reduce((a, e) => (a[e.kind] = (a[e.kind] ?? 0) + 1, a), {});
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : w.endsWith('h') ? 'es' : 's'}`;
 
 function setStage(s) {
-  stage = s; stageAt = performance.now(); document.body.dataset.stage = s;
-  document.querySelectorAll('#steps button[data-s]').forEach((b) => b.classList.toggle('on', b.dataset.s === s));
-  controls.autoRotate = s === 'cloud' || s === 'bim';
-  if (cloud) { cloud.visible = s !== 'scan'; cloud.material.opacity = s === 'cloud' ? 1 : s === 'bim' ? 0.32 : 0.07; camMarker.visible = pathLine.visible = s === 'cloud'; }
+  stage = s; stageAt = clock(); document.body.dataset.stage = s;
+  const order = ['scan', 'cloud', 'bim', 'design'];
+  document.querySelectorAll('#steps button[data-s]').forEach((b) => { b.classList.toggle('on', b.dataset.s === s); b.classList.toggle('done', order.indexOf(b.dataset.s) < order.indexOf(s)); });
+  if (cloud) { cloud.visible = s !== 'scan'; frustum.visible = pathLine.visible = s === 'cloud'; }
   world.visible = s === 'bim' || s === 'design'; overlay.visible = s === 'design'; $('#labels').style.display = s === 'design' ? '' : 'none';
-  anim = null;
-  if (s === 'scan') { video.loop = true; video.playbackRate = 1; video.currentTime = 0; video.play().catch(() => {}); caption('Phone video of the site'); $('#stat').textContent = ''; }
-  if (s === 'cloud') { video.loop = false; video.currentTime = 0; video.playbackRate = 3; video.play().catch(() => {}); caption('LingBot-Map → point cloud'); frameCamera(-0.9, 0.95, 2.5); }
+  anim = null; revealDoneAt = 0; liveAt = 0; cutNow = Infinity; wipePlane.copy(NOCLIP());
+  $('#stat').innerHTML = '';
+  base = baseline();
+  if (base) frameModel(base);
+  else if (cloudC) { sceneC.copy(cloudC); sceneR = cloudR; }
+  if (s === 'scan') { video.loop = true; video.playbackRate = 1; video.currentTime = 0; if (!CAPTURE) video.play().catch(() => {}); caption('Phone walkthrough of the floor'); }
+  if (s === 'cloud') {
+    cloudRate = Math.max(1, vdur() / (CLOUD_TARGET_MS / 1000));
+    video.loop = false; video.currentTime = 0; video.playbackRate = Math.min(16, cloudRate); if (!CAPTURE) video.play().catch(() => {});
+    caption(meta ? 'LingBot-Map reconstructs the scan' : 'No point cloud yet — run reconstruct_scan');
+    if (cloud) revealTo(0);
+  }
   if (s === 'bim') {
-    video.pause(); revealTo(1e9); groups.forEach((r) => world.remove(r.group)); groups.clear();
-    const h0 = S?.history?.[0];
-    if (h0) { applyModel(h0.model, { animate: true, stagger: 90 }); const c = count(h0.model);
-      caption('Point cloud → as-built BIM'); $('#stat').textContent = `${c.wall} walls · ${c.door} doors · ${c.window} windows · scan fit P50 ${h0.model.scan?.fit_p50_mm ?? '–'} mm`; }
-    else caption('No BIM yet — run fit_bim');
-    frameCamera(-0.9, 1.0, 2.4);
+    video.pause(); if (cloud) revealTo(1e9);
+    groups.forEach((r) => world.remove(r.group)); groups.clear(); labelKey = '';
+    if (base) {
+      const ax = Math.cos(cam.az + Math.PI / 2), ay = Math.sin(cam.az + Math.PI / 2);
+      const along = (e) => (e.pose.pos[0] * ax + e.pose.pos[1] * ay);
+      applyModel(base, { animate: true, stagger: 2600, order: (a, b) => (KIND_RANK[a.kind] ?? 5) - (KIND_RANK[b.kind] ?? 5) || along(a) - along(b) });
+      groups.forEach((r) => (r.born += 700));
+      const c = count(base), bits = [];
+      if (c.wall) bits.push(plural(c.wall, 'wall')); if (c.door) bits.push(plural(c.door, 'door')); if (c.window) bits.push(plural(c.window, 'window'));
+      if (c.equipment) bits.push(`${c.equipment} equipment`); if (c.column) bits.push(plural(c.column, 'column'));
+      caption('Point cloud → as-built model');
+      $('#stat').innerHTML = bits.join(' · ') + (base.scan?.fit_p50_mm != null ? ` · fit <b>${base.scan.fit_p50_mm} mm</b> P50` : '');
+    } else caption('No BIM yet — run fit_bim');
   }
   if (s === 'design') {
-    video.pause(); revealTo(1e9); controls.autoRotate = false; $('#stat').textContent = '';
-    if (S?.history?.length) { applyModel(S.history[0].model); queue = S.history.slice(1); shown = S.history.length; busyUntil = performance.now() + 700; pills(null); side(S, false); caption('Agent designs with you'); }
-    frameCamera(-1.15, 1.08, 2.3);
+    video.pause(); if (cloud) revealTo(1e9);
+    if (base) applyModel(base);
+    queue = S?.history ? S.history.slice(baseIdx + 1) : []; shown = S?.history?.length ?? 0;
+    evMs = clamp(26000 / Math.max(1, queue.length), 700, 1400);
+    busyUntil = stageAt + 1700; pills(null); if (S) side(S, false); S && (S._liveShown = null); egressKey = ''; overlay.clear();
+    focus = { c: null, w: 0, goal: 0 };
+    caption('The agent redesigns it with you');
   }
+  camStage();
 }
-const count = (m) => Object.values(m.elements).reduce((a, e) => (a[e.kind] = (a[e.kind] ?? 0) + 1, a), { wall: 0, door: 0, window: 0 });
+
+function movedNames(a) {   // elements that actually move in a physics clip
+  const f0 = a.frames[0], f1 = a.frames.at(-1), out = [];
+  for (const id of Object.keys(f1)) {
+    const p = f0[id], q = f1[id]; if (!p) continue;
+    const d = Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]), dq = Math.abs(p[3] * q[3] + p[4] * q[4] + p[5] * q[5] + p[6] * q[6]);
+    if (d > 0.05 || dq < 0.996) out.push(groups.get(id)?.el.name ?? id);
+  }
+  return out;
+}
+
+function focusOn(ids) {
+  const box = new THREE.Box3();
+  for (const id of ids) { const r = groups.get(id); if (r && r.el.kind !== 'slab') elementBox(r.el, box); }
+  if (box.isEmpty()) { focus.goal = 0; return; }
+  focus.c = box.getCenter(new THREE.Vector3()); focus.c.z = Math.min(focus.c.z, sceneC.z); focus.goal = 1;
+}
 
 function stepReplay(now) {
   if (stage !== 'design' || !S || now < busyUntil) return;
+  if (anim) { anim = null; groups.forEach((r) => { r.group.position.copy(r.base); r.group.quaternion.copy(r.baseQ); }); }
   if (queue.length) {
     const ev = queue.shift();
-    const failing = ev.action === 'validate' && ev.validation && !(ev.validation.code_ok && ev.validation.safety_ok && ev.validation.physics_ok);
-    applyModel(ev.model, { animate: true, flag: ev.focus, flagColor: failing ? BAD : ACCENT });
-    caption(ev.caption); pills(ev.validation);
-    busyUntil = now + (ev.action === 'validate' ? 1700 : 1150);
-    if (ev.animation?.frames?.length) { anim = { frames: ev.animation.frames, fps: ev.animation.fps, t0: now + 500 }; busyUntil = now + 500 + ev.animation.frames.length * 1000 / ev.animation.fps + 900; }
+    const failing = ev.action === 'validate' && ev.validation && !(ev.validation.code_ok && ev.validation.safety_ok && ev.validation.physics_ok !== false);
+    applyModel(ev.model, { animate: true, flag: ev.focus ?? [], flagColor: failing ? BAD : ACCENT });
+    pills(ev.validation); focusOn(ev.focus ?? []);
+    caption(ev.caption);
+    busyUntil = now + evMs + (ev.action === 'validate' ? 500 : 0);
+    if (ev.animation?.frames?.length) {
+      const names = movedNames(ev.animation);
+      if (names.length) caption(`MuJoCo stability test · ${names.slice(0, 2).join(', ')} ${names.length > 1 ? 'fall' : 'falls'}`);
+      anim = { frames: ev.animation.frames, fps: (ev.animation.fps || 25) * 0.6, t0: now + 450 };   // 0.6x slow motion
+      busyUntil = anim.t0 + ev.animation.frames.length * 1000 / anim.fps + 1900;
+    }
     if (!queue.length) busyUntil += 300;
     return;
   }
-  if (anim) { anim = null; groups.forEach((r) => { r.group.position.copy(r.base); r.group.quaternion.copy(r.baseQ); }); }
   if (S._liveShown !== S.seq) {       // settled on the live model
+    const first = S._liveShown == null;
     S._liveShown = S.seq;
     const bad = (S.validation?.issues ?? []).filter((i) => i.severity === 'fail' && i.element).map((i) => i.element);
     applyModel(S.model, { animate: true, flag: bad, flagColor: BAD });
     pills(S.validation); side(S, true); drawEgress(S.validation);
-    caption(S.agent_note || S.history.at(-1)?.caption || '');
+    if (first) { caption(S.agent_note || liveSummary(S.validation) || S.history.at(-1)?.caption || ''); focus.goal = 0; liveAt = now; }
   }
 }
 
@@ -235,12 +488,82 @@ async function poll() {
     const r = await fetch('/api/state?since=' + (S?.seq ?? -1));
     if (r.status !== 200) return;
     const prev = S; S = await r.json();
+    if (prev) S._liveShown = prev._liveShown;
     if (stage === 'design') {
-      if (S.history.length > shown) queue.push(...S.history.slice(shown));
-      else if (S.history.length < shown) { queue = []; groups.forEach((g) => world.remove(g.group)); groups.clear(); }
+      if (S.history.length > shown) { queue.push(...S.history.slice(shown)); S._liveShown = null; liveAt = 0; }
+      else if (S.history.length < shown) { queue = []; groups.forEach((g) => world.remove(g.group)); groups.clear(); S._liveShown = null; }
       shown = S.history.length; side(S, !queue.length);
     } else if (!prev && S.stage === 'design' && location.hash === '#design') setStage('design');
   } catch { /* server restarting */ }
+}
+
+function liveSummary(v) {
+  if (!v?.counts) return '';
+  const { fail = 0, hold = 0 } = v.counts;
+  return fail || hold ? [fail && `${fail} to fix`, hold && `${hold} to sign off`].filter(Boolean).join(' · ') : 'All checks pass';
+}
+
+function status() {
+  const t = clock() - stageAt;
+  const done = stage === 'scan' ? t >= SCAN_MS
+    : stage === 'cloud' ? (!meta ? t > 3000 : revealDoneAt > 0 && clock() - revealDoneAt >= CLOUD_HOLD_MS)
+    : stage === 'bim' ? t >= BIM_MS
+    : (liveAt > 0 && clock() - liveAt >= 2500) || (!S?.history?.length && t > 3000);
+  return { stage, t, done, queue: queue.length, question: !!S?.questions?.find((q) => q.answer == null) };
+}
+
+// ---------------------------------------------------------------- per-stage animation
+const wipeLabel = $('#wipe');
+function setWipe(x) {      // NDC x of the divider: scan to the left, model to the right; null = off
+  if (x == null) { wipePlane.copy(NOCLIP()); if (cloudU) cloudU.uWipe.value.set(0, 0, 0, 1); wipeLabel.style.opacity = 0; return; }
+  camera.updateMatrixWorld();
+  const eye = camera.position, ray = (sx) => new THREE.Vector3(sx, 0, 0.5).unproject(camera).sub(eye).normalize();
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+  const n = new THREE.Vector3().crossVectors(up, ray(x)).normalize();
+  if (n.dot(ray(x + 0.2)) < 0) n.negate();
+  wipePlane.setFromNormalAndCoplanarPoint(n, eye);
+  if (cloudU) cloudU.uWipe.value.set(n.x, n.y, n.z, wipePlane.constant);
+  wipeLabel.style.left = ((x + 1) / 2 * innerWidth) + 'px';
+  wipeLabel.style.opacity = clamp(Math.min(x + 1, 1 - x) * 6);
+}
+
+function animateStage(now) {
+  const t = now - stageAt;
+  if (stage === 'cloud' && meta) {
+    const vt = Math.min(vdur(), t / 1000 * cloudRate);
+    const n = revealTo(vt / vdur() * meta.frames * 1.0001);
+    if (!CAPTURE && !video.paused && Math.abs(video.currentTime - vt) > 0.4) video.currentTime = vt;
+    if (n >= meta.n && !revealDoneAt) revealDoneAt = now;
+    const fr = revealDoneAt ? 1 - span(now - revealDoneAt, 300, 1300) : 1;
+    frustum.scale.setScalar(Math.max(0.001, fr)); frustum.visible = fr > 0.01;
+    $('#stat').innerHTML = `<b>${fmt(n)}</b> points · frame ${Math.min(meta.frames, Math.floor(vt * meta.fps) + 1)} / ${meta.frames}`;
+    if (revealDoneAt && now - revealDoneAt > 600) caption('Coloured point cloud · gravity-aligned, metric');
+    cloudU.uOpModel.value = cloudU.uOpScan.value = 1;
+  }
+  if (stage === 'bim') {
+    if (cloudU) { cloudU.uOpModel.value = 1 - 0.8 * ease(span(t, 900, 3800)); cloudU.uOpScan.value = 1; cloudU.uReveal.value = meta.n; cloudU.uFresh.value = 1; }
+    // compare wipe: sweep in from the left, rock, then hand the frame back to the model
+    let w = null;
+    if (t > 4600 && t < 10200) {
+      w = t < 6200 ? -1.05 + 1.4 * ease(span(t, 4600, 6200)) : t < 7800 ? 0.35 - 0.7 * ease(span(t, 6200, 7800)) : t < 8800 ? -0.35 + 0.35 * ease(span(t, 7800, 8800)) : -1.05 * ease(span(t, 9200, 10200));
+      if (t > 6000 && t < 6100) caption('Scan vs. rebuilt model');
+    }
+    setWipe(w);
+  } else setWipe(null);
+  if (stage === 'design') {
+    const k = ease(span(t, 200, 1600));
+    cutNow = k >= 1 ? CUT : (ceiling + 0.5) + (CUT - ceiling - 0.5) * k;
+    clipCeiling.constant = Math.max(cutNow, 0.3) + 0.02;
+    if (cloudU) { cloudU.uOpModel.value = 1 - 0.85 * ease(span(t, 0, 1200)); cloudU.uFresh.value = 1; }
+    focus.w += (focus.goal - focus.w) * 0.03;
+    updateEgress(now);
+  } else if (stage !== 'scan') clipCeiling.constant = ceiling - 0.2;
+  for (const r of groups.values()) updateElement(r, now);
+  if (anim && now >= anim.t0) {
+    const f = anim.frames[Math.min(anim.frames.length - 1, Math.floor((now - anim.t0) / 1000 * anim.fps))];
+    for (const [id, p] of Object.entries(f)) { const r = groups.get(id); if (r) { r.group.position.set(p[0], p[1], p[2]); r.group.quaternion.set(p[4], p[5], p[6], p[3]); } }
+  }
+  if (toastUntil && now > toastUntil) { toastUntil = 0; $('#sent').textContent = selected ? 'Selected: ' + groups.get(selected)?.el.name : ''; $('#sent').className = ''; }
 }
 
 // ---------------------------------------------------------------- interaction
@@ -248,8 +571,7 @@ document.querySelectorAll('#steps button[data-s]').forEach((b) => (b.onclick = (
 $('#play').onclick = () => { autoplay = true; setStage('scan'); };
 $('#say form').onsubmit = (ev) => {
   ev.preventDefault(); const i = $('#say input'); if (!i.value.trim()) return;
-  post('/api/message', { text: i.value.trim(), selected }); i.value = ''; $('#sent').textContent = 'Sent to the agent';
-  setTimeout(() => ($('#sent').textContent = selected ? 'Selected: ' + groups.get(selected)?.el.name : ''), 2500);
+  post('/api/message', { text: i.value.trim(), selected }); i.value = ''; toast('Sent to the agent ✓', true); i.blur();
 };
 const ray = new THREE.Raycaster(); let down = null;
 renderer.domElement.addEventListener('pointerdown', (e) => (down = [e.clientX, e.clientY]));
@@ -265,31 +587,65 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 
 // ---------------------------------------------------------------- loop
 const v3 = new THREE.Vector3();
+let holdAt = 0;
 function tick(now) {
-  requestAnimationFrame(tick);
-  if (camGoal && camGoal.t < 1) { camGoal.t = Math.min(1, camGoal.t + 0.025); const k = 1 - Math.pow(1 - camGoal.t, 3); camera.position.lerpVectors(camGoal.from, camGoal.pos, k); }
-  if (stage === 'cloud' && meta) revealTo(video.ended ? 1e9 : video.currentTime * meta.fps);
-  for (const r of groups.values()) if (r.born) {
-    const k = Math.min(1, Math.max(0, (now - r.born) / 550)); r.group.scale.z = Math.max(0.001, 1 - Math.pow(1 - k, 3)); if (k >= 1) r.born = 0;
-  }
-  if (anim && now >= anim.t0) {
-    const f = anim.frames[Math.min(anim.frames.length - 1, Math.floor((now - anim.t0) / 1000 * anim.fps))];
-    for (const [id, p] of Object.entries(f)) { const r = groups.get(id); if (r) { r.group.position.set(p[0], p[1], p[2]); r.group.quaternion.set(p[4], p[5], p[6], p[3]); } }
-  }
+  animateStage(now);
   stepReplay(now);
   if (autoplay) {
-    const dt = now - stageAt;
-    if (stage === 'scan' && dt > 4500) setStage('cloud');
-    else if (stage === 'cloud' && (video.ended || dt > 16000) && dt > 3000) { if (dt > (video.ended ? 0 : 16000) && !tick.hold) { tick.hold = now; } if (tick.hold && now - tick.hold > 2200) { tick.hold = 0; setStage('bim'); } }
-    else if (stage === 'bim' && dt > 5500) { autoplay = false; setStage('design'); }
+    if (status().done) { holdAt ||= now; if (now - holdAt > 900) { holdAt = 0; const nx = { scan: 'cloud', cloud: 'bim', bim: 'design' }[stage]; if (nx) setStage(nx); else autoplay = false; } }
   }
-  controls.update(); renderer.render(scene, camera);
-  if (stage === 'design') for (const l of labels) { v3.copy(l.v).project(camera); l.d.style.left = ((v3.x + 1) / 2 * innerWidth) + 'px'; l.d.style.top = ((1 - v3.y) / 2 * innerHeight) + 'px'; }
+  updateCamera(now);
+  renderer.render(scene, camera);
+  if (stage === 'design') for (const l of labels) {
+    v3.copy(l.v).project(camera); l.d.style.left = ((v3.x + 1) / 2 * innerWidth) + 'px'; l.d.style.top = ((1 - v3.y) / 2 * innerHeight) + 'px';
+  }
 }
 
+// ---------------------------------------------------------------- capture hooks (scripts/record_demo.py)
+const animStart = new WeakMap();
+function syncCssAnimations() {   // CSS transitions/keyframes follow the virtual clock
+  for (const a of document.getAnimations()) {
+    let s = animStart.get(a); if (s == null) { s = vnow; animStart.set(a, s); a.pause(); }
+    a.currentTime = vnow - s;
+  }
+}
+const seekVideo = (t) => new Promise((res) => {
+  if (Math.abs(video.currentTime - t) < 0.004) return res();
+  const done = () => { video.removeEventListener('seeked', done); clearTimeout(to); res(); };
+  const to = setTimeout(done, 3000);
+  video.addEventListener('seeked', done); video.currentTime = t;
+});
+let cursor = { x: innerWidth * 0.62, y: innerHeight * 0.55, fx: 0, fy: 0, tx: 0, ty: 0, t0: 0, ms: 1 };
+window.__demo = {
+  capture: CAPTURE,
+  status,
+  go: (s) => { autoplay = false; setStage(s); return status(); },
+  poll: () => poll().then(status),
+  async frame(ms) {            // advance the virtual clock to ms, render, line the video up, settle CSS
+    vnow = ms;
+    const t = vnow - stageAt;
+    if (stage === 'scan') await seekVideo((t / 1000) % vdur());
+    else if (stage === 'cloud') await seekVideo(Math.min(vdur() - 0.04, t / 1000 * cloudRate));
+    tick(vnow);
+    const c = cursor, k = ease((vnow - c.t0) / c.ms);
+    c.x = c.fx + (c.tx - c.fx) * k; c.y = c.fy + (c.ty - c.fy) * k;
+    $('#cursor').style.left = c.x + 'px'; $('#cursor').style.top = c.y + 'px';
+    syncCssAnimations();
+    return status();
+  },
+  cursor(x, y, ms = 800, show = true) { Object.assign(cursor, { fx: cursor.x, fy: cursor.y, tx: x, ty: y, t0: vnow, ms: Math.max(1, ms) }); $('#cursor').style.display = show ? 'block' : 'none'; },
+  click() { const c = $('#cursor'); c.classList.remove('click'); void c.offsetWidth; c.classList.add('click'); },
+};
+
+if (!CAPTURE) addEventListener('error', () => {});
 await loadCloud();
+await new Promise((r) => (video.readyState >= 1 ? r() : (video.addEventListener('loadedmetadata', r, { once: true }), video.addEventListener('error', r, { once: true }), setTimeout(r, 4000))));
 await poll();
 const start = location.hash.slice(1);
 setStage(['scan', 'cloud', 'bim', 'design'].includes(start) ? start : 'scan');
-setInterval(poll, 800);
-requestAnimationFrame(tick);
+if (CAPTURE) { video.pause(); window.__demo.ready = true; }
+else {
+  setInterval(poll, 800);
+  const loop = (now) => { requestAnimationFrame(loop); tick(now); };
+  requestAnimationFrame(loop);
+}
