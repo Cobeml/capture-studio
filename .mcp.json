@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "capture-studio": { "type": "http", "url": "http://127.0.0.1:8642/mcp" }
+  }
+}
