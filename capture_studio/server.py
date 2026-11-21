@@ -412,14 +412,26 @@ def get_code_rules() -> dict:
 
 @mcp.tool()
 def get_user_messages(mark_read: bool = True) -> dict:
-    """Unread messages the human typed in the viewer (wishes, corrections, answers)."""
+    """Unread messages the human typed in the viewer (wishes, corrections, answers).
+    If the human highlighted objects in the 3D view while writing, the message carries
+    `selected_elements`: those elements' ids and properties — "this", "these", "it" refer to them."""
     s = store.load()
     new = [m for m in s["messages"] if not m["read"]]
+    els = s["model"]["elements"]
+    for m in new:
+        sel = m.get("selected") or []
+        sel = [sel] if isinstance(sel, str) else sel
+        m["selected_elements"] = [bim.brief(s["model"], els[i]) | {k: els[i][k] for k in ("label", "function") if k in els[i]}
+                                  for i in sel if i in els]
+    out_msgs = [dict(m) for m in new]
+    for m in new:
+        m.pop("selected_elements", None)      # derived on read, not stored
     if mark_read and new:
         for m in new:
             m["read"] = True
         store.save(s)
-    return {"messages": new, "open_questions": [q for q in s["questions"] if q["answer"] is None]}
+    out = {"messages": out_msgs, "open_questions": [q for q in s["questions"] if q["answer"] is None]}
+    return out
 
 
 @mcp.tool()

@@ -305,7 +305,8 @@ def brief(model: dict, e: dict) -> dict:
         b.update(min=_r(e["min"]), max=_r(e["max"]), top=e["top"])
     else:
         b.update({key: e[key] for key in ("pos", "size", "yaw_deg", "start", "end", "height", "material", "anchored",
-                                          "category", "mass_kg", "hazard", "guarded", "fixed") if key in e})
+                                          "category", "mass_kg", "hazard", "guarded", "fixed", "label", "function",
+                                          "object_key") if key in e})
     if "fit" in e:
         b["fit_mm"] = e["fit"]
     return b
