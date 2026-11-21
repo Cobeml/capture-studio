@@ -95,6 +95,12 @@
     border:2px solid #fff; opacity:0; }
   #cursor.click::after { animation:ring .5s ease-out; }
   @keyframes ring { from { opacity:.9; transform:scale(.3); } to { opacity:0; transform:scale(1); } }
+  body[data-follow] #brand, body[data-follow] #caption, body[data-follow] #pills, body[data-follow] #side, body[data-follow] #say,
+  body[data-follow] #steps, body[data-follow] #stat, body[data-follow] #labels, body[data-follow] #wipe, body[data-follow] #vignette,
+  body[data-follow] #cursor { display:none !important; }
+  body[data-follow] #video { opacity:0 !important; transition:none !important; pointer-events:none; }
+  body[data-follow="video"] #video { left:0 !important; top:0 !important; bottom:auto !important; width:100vw !important; height:100vh !important;
+    transform:none !important; border-radius:0 !important; object-fit:cover; opacity:1 !important; box-shadow:none !important; }
 </style>
 </head>
 <body data-stage="scan">

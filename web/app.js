@@ -5,7 +5,8 @@ import * as THREE from 'three';
 import { OrbitControls } from '/web/vendor/OrbitControls.js';
 
 const $ = (s) => document.querySelector(s);
-const CAPTURE = new URLSearchParams(location.search).has('capture');
+const PARAMS = new URLSearchParams(location.search);
+const CAPTURE = PARAMS.has('capture');
 let vnow = 0;
 const clock = () => (CAPTURE ? vnow : performance.now());
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
@@ -35,8 +36,10 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true; controls.maxPolarAngle = Math.PI * 0.49;
 let manual = false;
 controls.addEventListener('start', () => (manual = true));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.6));
-const sun = new THREE.DirectionalLight(0xffffff, 1.7); sun.position.set(6, -9, 14); scene.add(sun);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x30343c, 1.6); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.7); sun.position.set(6, -9, 14); scene.add(sun); scene.add(sun.target);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+sun.castShadow = true; sun.shadow.mapSize.set(4096, 4096); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03;
 const fill = new THREE.DirectionalLight(0x9fb4d0, 0.5); fill.position.set(-8, 7, 5); scene.add(fill);
 let grid = null;
 
@@ -49,8 +52,9 @@ const sceneC = new THREE.Vector3(4, 3, 1); let sceneR = 9, ceiling = 2.9, cloudC
 
 function resize() {
   renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
-  if (cloudU) cloudU.uScale.value = renderer.domElement.height / 2 / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  updateScale();
 }
+function updateScale() { if (cloudU) cloudU.uScale.value = renderer.domElement.height / 2 / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2); }
 addEventListener('resize', resize); resize();
 
 // ---------------------------------------------------------------- camera director (target + azimuth/elevation/distance)
@@ -92,26 +96,26 @@ function updateCamera(now) {
 const CLOUD_VS = `
 #include <common>
 #include <clipping_planes_pars_vertex>
-uniform float uReveal, uFresh, uSize, uScale; uniform vec3 uHi; uniform vec4 uWipe;
+uniform float uReveal, uLo, uFresh, uSize, uScale, uMinPx, uMaxPx; uniform vec3 uHi; uniform vec4 uWipe;
 varying vec3 vColor; varying float vSide;
 void main() {
   float id = float(gl_VertexID);
-  if (id >= uReveal) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  if (id >= uReveal || id < uLo) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
   vec4 wp = modelMatrix * vec4(position, 1.0);
   vec4 mvPosition = viewMatrix * wp;
   float fresh = 1.0 - smoothstep(0.0, 1.0, (uReveal - id) / max(uFresh, 1.0));
   vColor = mix(color, uHi, fresh * 0.8);
   vSide = dot(uWipe.xyz, wp.xyz) + uWipe.w;
-  gl_PointSize = max(1.5, uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6));
+  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6), uMinPx, uMaxPx);
   gl_Position = projectionMatrix * mvPosition;
   #include <clipping_planes_vertex>
 }`;
 const CLOUD_FS = `
 #include <clipping_planes_pars_fragment>
-uniform float uOpScan, uOpModel; varying vec3 vColor; varying float vSide;
+uniform float uOpScan, uOpModel, uRound; varying vec3 vColor; varying float vSide;
 void main() {
   #include <clipping_planes_fragment>
-  vec2 c = gl_PointCoord - 0.5; if (dot(c, c) > 0.25) discard;
+  vec2 c = gl_PointCoord - 0.5; if (uRound > 0.5 && dot(c, c) > 0.25) discard;
   gl_FragColor = vec4(vColor, vSide < 0.0 ? uOpScan : uOpModel);
 }`;
 const clipCeiling = new THREE.Plane(new THREE.Vector3(0, 0, -1), 2.7);
@@ -124,9 +128,10 @@ async function loadCloud() {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
-  cloudU = { uReveal: { value: n }, uFresh: { value: n / Math.max(1, meta.frames) }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 },
+  cloudU = { uReveal: { value: n }, uLo: { value: 0 }, uFresh: { value: n / Math.max(1, meta.frames) }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 },
     uScale: { value: 500 }, uHi: { value: new THREE.Color(1.0, 0.62, 0.32) }, uWipe: { value: new THREE.Vector4(0, 0, 0, 1) },
-    uOpScan: { value: 1 }, uOpModel: { value: 1 } };
+    uOpScan: { value: 1 }, uOpModel: { value: 1 }, uMinPx: { value: 1.5 }, uMaxPx: { value: 64 }, uRound: { value: 1 } };
+  updateScale();
   cloud = new THREE.Points(g, new THREE.ShaderMaterial({ uniforms: cloudU, vertexShader: CLOUD_VS, fragmentShader: CLOUD_FS, vertexColors: true,
     transparent: true, depthWrite: true, clipping: true, clippingPlanes: [clipCeiling] }));
   cloud.frustumCulled = false; cloud.visible = false; scene.add(cloud);
@@ -219,7 +224,7 @@ function buildElement(e) {
   for (const b of e.boxes ?? []) {
     const geo = new THREE.BoxGeometry(...b.s), bg = new THREE.Group();
     bg.position.set(b.c[0], b.c[1], b.c[2]);
-    const mesh = new THREE.Mesh(geo, elementMaterial(e)); mesh.userData.id = e.id; bg.add(mesh);
+    const mesh = new THREE.Mesh(geo, elementMaterial(e)); mesh.userData.id = e.id; mesh.castShadow = e.kind !== 'slab' && e.kind !== 'window'; mesh.receiveShadow = true; bg.add(mesh);
     if (e.kind !== 'slab') bg.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat(proposed ? ACCENT : 0x2b3038, proposed ? 1 : 0.6)));
     g.add(bg);
     parts.push({ bg, bottom: b.c[2] - b.s[2] / 2, h: b.s[2], z0: e.pose.pos[2], cut: proposed || e.kind === 'slab' ? null : cutH });
@@ -244,6 +249,7 @@ function frameModel(model) {   // scene bounds from slab/walls/equipment, else t
   box.getCenter(sceneC); const sz = box.getSize(new THREE.Vector3());
   sceneC.z = Math.min(sceneC.z, ceiling * 0.35);
   sceneR = Math.max(1.5, Math.hypot(sz.x, sz.y) / 2, sz.z / 2) * 1.02;
+  placeSun();
   ceiling = model.level?.ceiling_height ?? ceiling; clipCeiling.constant = ceiling - 0.2;
   buildGrid();
 }
@@ -287,9 +293,10 @@ function updateElement(r, now) {
 }
 
 function setFlag(rec, color) {
-  const proposed = rec.el.provenance === 'proposed';
+  const proposed = rec.el.provenance === 'proposed', eDef = follow ? 0xe6ebf0 : 0x2b3038, eOp = follow ? 0.3 : 0.6;
   rec.group.traverse((o) => {
-    if (o.isLineSegments) { o.material.color.setHex(color ?? (proposed ? ACCENT : 0x2b3038)); o.material.opacity = color ? 1 : (proposed ? 1 : 0.6); }
+    if (o.userData.ghost) return;
+    if (o.isLineSegments) { o.material.color.setHex(color ?? (proposed ? ACCENT : eDef)); o.material.opacity = color ? 1 : (proposed ? 1 : eOp); }
     if (o.isMesh && o.material.emissive && rec.el.kind !== 'slab') {
       o.material.emissive.setHex(color ?? (proposed ? ACCENT : 0)); o.material.emissiveIntensity = color === BAD ? 0.75 : color ? 0.45 : (proposed ? 0.2 : 0);
     }
@@ -393,6 +400,7 @@ const count = (m) => Object.values(m.elements).reduce((a, e) => (a[e.kind] = (a[
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : w.endsWith('h') ? 'es' : 's'}`;
 
 function setStage(s) {
+  if (follow) exitFollow();
   stage = s; stageAt = clock(); document.body.dataset.stage = s;
   const order = ['scan', 'cloud', 'bim', 'design'];
   document.querySelectorAll('#steps button[data-s]').forEach((b) => { b.classList.toggle('on', b.dataset.s === s); b.classList.toggle('done', order.indexOf(b.dataset.s) < order.indexOf(s)); });
@@ -585,10 +593,173 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   $('#sent').textContent = selected ? 'Selected: ' + groups.get(selected).el.name : '';
 });
 
+
+// ---------------------------------------------------------------- follow mode: first-person along the capture path
+// The camera sits on the (Catmull-Rom interpolated) LingBot-Map pose for video time t, with the video's horizontal FOV.
+// Layers: video | cloud | bim (as-built, last fit_bim) | design (live model) | cloud+bim | cloud+design.
+let follow = null, track = null;
+const FOLLOW_LAYERS = ['video', 'cloud', 'bim', 'design', 'cloud+bim', 'cloud+design'];
+const BG = new THREE.Color(0x0b0d10), BG_FOLLOW = new THREE.Color(0x15191e), FOG = new THREE.Fog(0x15191e, 9, 42);
+const floorGrid = new THREE.Group(); floorGrid.visible = false; scene.add(floorGrid);
+
+function frameDt() {        // seconds of source video per reconstruction frame
+  const p = parseFloat(PARAMS.get('frame_dt')); if (p > 0) return p;
+  if (meta?.frame_dt) return meta.frame_dt;
+  const nominal = 1 / (meta?.fps || 2), d = video.duration;
+  // frames were sampled every round(src_fps / fps) source frames over the whole clip: duration / frames is closer than 1/fps
+  if (meta && isFinite(d) && d > 0 && Math.abs(d / meta.frames - nominal) / nominal < 0.03) return d / meta.frames;
+  return nominal;
+}
+
+function buildTrack() {
+  const sig = parseFloat(PARAMS.get('smooth') || '0');
+  const raw = meta.cameras.map((c) => ({ p: new THREE.Vector3(c[0], c[1], c[2]), f: new THREE.Vector3(c[3], c[4], c[5]).normalize(),
+    u: c.length >= 9 ? new THREE.Vector3(c[6], c[7], c[8]).normalize() : new THREE.Vector3(0, 0, 1) }));
+  if (!(sig > 0)) return raw;
+  const R = Math.ceil(sig * 3);
+  return raw.map((_, i) => {
+    const o = { p: new THREE.Vector3(), f: new THREE.Vector3(), u: new THREE.Vector3() }; let w = 0;
+    for (let j = -R; j <= R; j++) { const r = raw[clamp(i + j, 0, raw.length - 1)], k = Math.exp(-j * j / (2 * sig * sig)); o.p.addScaledVector(r.p, k); o.f.addScaledVector(r.f, k); o.u.addScaledVector(r.u, k); w += k; }
+    o.p.divideScalar(w); o.f.normalize(); o.u.normalize(); return o;
+  });
+}
+const crm = (a, b, c, d, t, out) => { const t2 = t * t, t3 = t2 * t;
+  return out.set(0, 0, 0).addScaledVector(a, -0.5 * t3 + t2 - 0.5 * t).addScaledVector(b, 1.5 * t3 - 2.5 * t2 + 1).addScaledVector(c, -1.5 * t3 + 2 * t2 + 0.5 * t).addScaledVector(d, 0.5 * t3 - 0.5 * t2); };
+const _fw = new THREE.Vector3(), _up = new THREE.Vector3(), _rt = new THREE.Vector3(), _bk = new THREE.Vector3(), _m4 = new THREE.Matrix4();
+function applyPose(t) {
+  const T = track, n = T.length; if (n < 2) return;
+  const f = clamp(t / frameDt(), 0, n - 1), i = Math.min(Math.floor(f), n - 2), k = f - i, g = (j) => T[clamp(j, 0, n - 1)];
+  crm(g(i - 1).p, g(i).p, g(i + 1).p, g(i + 2).p, k, camera.position);
+  crm(g(i - 1).f, g(i).f, g(i + 1).f, g(i + 2).f, k, _fw).normalize();
+  crm(g(i - 1).u, g(i).u, g(i + 1).u, g(i + 2).u, k, _up).normalize();
+  _rt.crossVectors(_fw, _up).normalize(); _up.crossVectors(_rt, _fw).normalize();
+  _m4.makeBasis(_rt, _up, _bk.copy(_fw).negate()); camera.quaternion.setFromRotationMatrix(_m4);
+}
+function followFov() {       // vertical FOV at the output aspect that gives the video's horizontal FOV
+  const th = Math.tan(THREE.MathUtils.degToRad(meta.fov_y_deg ?? 55) / 2) * (meta.aspect ?? 16 / 9) * (parseFloat(PARAMS.get('fov_scale')) || 1);
+  return THREE.MathUtils.radToDeg(2 * Math.atan(th / camera.aspect));
+}
+
+function setModelOpacity(op) {
+  world.traverse((o) => {
+    if (!o.material || !o.material.isMaterial || o.userData.ghost) return;
+    const m = o.material, u = o.userData;
+    if (u.op0 == null) { u.op0 = m.opacity; u.tr0 = m.transparent; u.dw0 = m.depthWrite; }
+    const tr = op < 1 || u.tr0;
+    if (m.transparent !== tr) { m.transparent = tr; m.needsUpdate = true; }
+    m.opacity = u.op0 * op; m.depthWrite = op < 1 ? false : u.dw0;
+  });
+}
+
+function enterFollow(layer) {
+  if (!meta?.cameras?.length) return;
+  if (!FOLLOW_LAYERS.includes(layer)) layer = 'cloud';
+  if (!track) track = buildTrack();
+  if (!follow) { follow = { t: CAPTURE ? 0 : video.currentTime, layer }; if (!CAPTURE) { video.loop = true; video.playbackRate = 1; video.play().catch(() => {}); } }
+  follow.layer = layer; document.body.dataset.follow = layer;
+  camera.fov = followFov(); camera.near = 0.03; camera.updateProjectionMatrix(); updateScale();
+  const hasCloud = layer === 'cloud' || layer.startsWith('cloud+'), which = layer.includes('bim') ? 'bim' : layer.includes('design') ? 'design' : null;
+  anim = null; cutNow = Infinity; setWipe(null); clipCeiling.constant = 1e6; overlay.visible = false; $('#labels').style.display = 'none';
+  if (cloud) {
+    cloud.visible = hasCloud; frustum.visible = pathLine.visible = false; cloud.geometry.setDrawRange(0, meta.n);
+    const u = cloudU; u.uReveal.value = meta.n; u.uFresh.value = 1; u.uOpModel.value = u.uOpScan.value = 1;
+    u.uSize.value = (meta.voxel_m ?? 0.02) * 1.3; u.uMinPx.value = 1.5; u.uMaxPx.value = 13; u.uRound.value = 0;
+  }
+  world.visible = !!which;
+  if (which) {
+    base = baseline();
+    const m = which === 'bim' ? base : S?.model;
+    if (m) applyModel(m);
+    groups.forEach((r) => { r.born = 0; r.group.position.copy(r.base); r.group.quaternion.copy(r.baseQ); updateElement(r, clock()); });
+    groups.forEach((r) => { setFlag(r, null); r.near = null; });
+    setModelOpacity(hasCloud ? 0.45 : 1);
+    if (which === 'design') groups.forEach(addGhost); else dropGhosts();     // proposed work stays visible through scanned equipment
+
+  }
+  hemi.intensity = which && !hasCloud ? 2.3 : 1.6;
+  if (grid) grid.visible = false;
+  floorGrid.visible = !!which;
+  scene.fog = which && !hasCloud ? FOG : null;
+  scene.background = which && !hasCloud ? BG_FOLLOW : BG;
+}
+
+function addGhost(r) {
+  if (r.ghost || r.el.provenance !== 'proposed' || r.el.kind === 'space') return;
+  r.ghost = [];
+  for (const p of r.parts) {
+    const mesh = p.bg.children.find((o) => o.isMesh); if (!mesh) continue;
+    const fillG = new THREE.Mesh(mesh.geometry, new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.22, depthTest: false, depthWrite: false, fog: false }));
+    const edgeG = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.85, depthTest: false, fog: false }));
+    fillG.renderOrder = edgeG.renderOrder = 20; fillG.userData.ghost = edgeG.userData.ghost = true;
+    p.bg.add(fillG, edgeG); r.ghost.push(fillG, edgeG);
+  }
+}
+function dropGhosts() { groups.forEach((r) => { r.ghost?.forEach((o) => o.parent?.remove(o)); r.ghost = null; }); }
+
+function followWin() { const w = PARAMS.get('win'); return w == null ? 12 : parseFloat(w) || 0; }   // frames either side; 0 = whole cloud
+function nearFade(r, k) {
+  const g = follow?.layer.startsWith('cloud+') ? 0.45 : 1;
+  r.group.traverse((o) => {
+    const m = o.material; if (!m?.isMaterial || o.userData.ghost) return; const u = o.userData; if (u.op0 == null) { u.op0 = m.opacity; u.tr0 = m.transparent; u.dw0 = m.depthWrite; }
+    const op = g * k, tr = op < 1 || u.tr0; if (m.transparent !== tr) { m.transparent = tr; m.needsUpdate = true; }
+    m.opacity = u.op0 * op; m.depthWrite = op < 1 ? false : u.dw0;
+  });
+}
+
+function exitFollow() {
+  follow = null; delete document.body.dataset.follow;
+  camera.fov = 40; camera.near = 0.05; camera.updateProjectionMatrix(); updateScale();
+  scene.fog = null; scene.background = BG; floorGrid.visible = false; if (grid) grid.visible = true;
+  setModelOpacity(1); hemi.intensity = 1.6;
+  dropGhosts();
+  groups.forEach((r) => { r.group.visible = true; r.near = null; setFlag(r, null); });
+  if (cloudU) cloudU.uLo.value = 0;
+  if (cloudU) { cloudU.uSize.value = (meta.voxel_m ?? 0.02) * 1.35; cloudU.uMinPx.value = 1.5; cloudU.uMaxPx.value = 64; cloudU.uRound.value = 1; }
+  manual = false;
+}
+
+function followTick() {
+  if (!CAPTURE) follow.t = video.currentTime;
+  if (follow.layer === 'video') return;
+  applyPose(follow.t);
+  if (cloud && cloud.visible) {           // temporal window: only points from frames near now, so drift ghosts from other passes stay out
+    const W = followWin(), f = follow.t / frameDt(), O = meta.frame_offsets, F = meta.frames;
+    if (W > 0) { const a = clamp(Math.floor(f - W), 0, F), b = clamp(Math.ceil(f + W) + 1, 0, F); cloudU.uLo.value = O[a]; cloudU.uReveal.value = O[b] ?? meta.n; }
+    else { cloudU.uLo.value = 0; cloudU.uReveal.value = meta.n; }
+  }
+  for (const r of groups.values()) {      // never render from inside a box: hide elements that contain the eye
+    if (r.el.kind === 'slab' || r.el.kind === 'space') continue;
+    r.box ??= elementBox(r.el);
+    const k = clamp((r.box.distanceToPoint(camera.position) - 0.35) / 1.0);   // fade boxes the eye is in or right against
+    r.group.visible = k > 0.02;
+    if (r.near !== k) { r.near = k; nearFade(r, k); }
+  }
+  renderer.render(scene, camera);
+}
+
+addEventListener('keydown', (e) => {      // f: follow mode, 1-6: layer, Esc: back to the stages
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'f' && !follow) enterFollow('cloud');
+  else if (follow && '123456'.includes(e.key) && e.key.length === 1) enterFollow(FOLLOW_LAYERS['123456'.indexOf(e.key)]);
+  else if (e.key === 'Escape' && follow) setStage(stage);
+});
+
+function placeSun() {
+  sun.position.copy(sceneC).addScaledVector(new THREE.Vector3(6, -9, 14).normalize(), sceneR * 2.2);
+  sun.target.position.copy(sceneC);
+  const c = sun.shadow.camera, r = sceneR * 1.15;
+  c.left = -r; c.right = r; c.top = r; c.bottom = -r; c.near = 0.1; c.far = sceneR * 5; c.updateProjectionMatrix();
+  floorGrid.clear();
+  const n = Math.ceil(sceneR * 2.4), g = new THREE.GridHelper(n, n, 0x000000, 0x000000);
+  g.material.transparent = true; g.material.opacity = 0.22; g.material.depthWrite = false;
+  g.rotation.x = Math.PI / 2; g.position.set(Math.round(sceneC.x), Math.round(sceneC.y), 0.006); floorGrid.add(g);
+}
+
 // ---------------------------------------------------------------- loop
 const v3 = new THREE.Vector3();
 let holdAt = 0;
 function tick(now) {
+  if (follow) { followTick(); return; }
   animateStage(now);
   stepReplay(now);
   if (autoplay) {
@@ -635,6 +806,14 @@ window.__demo = {
   },
   cursor(x, y, ms = 800, show = true) { Object.assign(cursor, { fx: cursor.x, fy: cursor.y, tx: x, ty: y, t0: vnow, ms: Math.max(1, ms) }); $('#cursor').style.display = show ? 'block' : 'none'; },
   click() { const c = $('#cursor'); c.classList.remove('click'); void c.offsetWidth; c.classList.add('click'); },
+  async follow(layer, t) {   // first-person render of one layer at video time t (s); the video layer seeks the <video>
+    if (!follow || follow.layer !== layer) enterFollow(layer);
+    follow.t = t;
+    if (layer === 'video') await seekVideo(Math.min(vdur() - 0.02, t));
+    followTick();
+    return { layer, t, frame: t / frameDt(), fov: camera.fov };
+  },
+  followInfo: () => ({ frameDt: frameDt(), fov: camera.fov, frames: meta?.frames, duration: vdur() }),
 };
 
 if (!CAPTURE) addEventListener('error', () => {});
@@ -643,6 +822,7 @@ await new Promise((r) => (video.readyState >= 1 ? r() : (video.addEventListener(
 await poll();
 const start = location.hash.slice(1);
 setStage(['scan', 'cloud', 'bim', 'design'].includes(start) ? start : 'scan');
+if (PARAMS.get('follow') && meta) enterFollow(PARAMS.get('follow'));
 if (CAPTURE) { video.pause(); window.__demo.ready = true; }
 else {
   setInterval(poll, 800);

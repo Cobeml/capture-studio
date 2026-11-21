@@ -70,10 +70,15 @@ def main():
     pts = unproject_depth_map_to_point_map(depth, extr, intr)  # (S,H,W,3)
     rgb = (images_cpu.permute(0, 2, 3, 1).numpy() * 255).clip(0, 255).astype(np.uint8)
 
+    import cv2
+    cap = cv2.VideoCapture(a.video)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    frame_dt = max(1, round(src_fps / a.fps)) / src_fps      # LingBot's loader keeps every Nth source frame
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         a.out, points=pts.astype(np.float32), rgb=rgb, conf=conf.astype(np.float32),
-        extrinsic=extr, intrinsic=intr, fps=a.fps, inference_seconds=secs,
+        extrinsic=extr, intrinsic=intr, fps=a.fps, frame_dt=frame_dt, inference_seconds=secs,
     )
     print("saved", a.out, pts.shape)
 

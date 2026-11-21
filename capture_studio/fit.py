@@ -186,6 +186,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     offsets = np.searchsorted(f_idx, np.arange(S + 1)).tolist()
     meta = {
         "n": int(len(P)), "frames": int(S), "fps": float(z["fps"]), "frame_offsets": offsets,
+        "frame_dt": float(z["frame_dt"]) if "frame_dt" in z else 1.0 / float(z["fps"]),   # seconds of video per frame
         # per frame: position, forward, up (model frame) — enough to re-fly the capture path exactly
         "cameras": [[round(float(v), 4) for v in (*C[i], *fwd[i], *upv[i])] for i in range(S)],
         "fov_y_deg": round(float(np.degrees(2 * np.arctan(H / 2 / np.median(z["intrinsic"][:, 1, 1])))), 2),
