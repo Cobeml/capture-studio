@@ -12,7 +12,8 @@ import sys
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-URL = "http://127.0.0.1:8642/mcp"
+import os
+URL = os.environ.get("CAPTURE_STUDIO_MCP", "http://127.0.0.1:8642/mcp")
 
 
 async def main(argv):
@@ -33,7 +34,7 @@ async def main(argv):
                 res = await s.call_tool(name, args)
                 text = "".join(c.text for c in res.content if hasattr(c, "text"))
                 try:
-                    text = json.dumps(json.loads(text), indent=1)
+                    text = json.dumps(json.loads(text), indent=1 if "--pretty" in sys.argv else None)
                 except ValueError:
                     pass
                 print(f"── {name} {'(error)' if res.isError else ''}\n{text}")

@@ -39,13 +39,13 @@ def save(state: dict):
         tmp.replace(STATE)
 
 
-def record(state: dict, actor: str, action: str, caption: str, focus: list[str] | None = None):
+def record(state: dict, actor: str, action: str, caption: str, focus: list[str] | None = None, animation=None):
     """Append a history event (with a full model copy, so the viewer can replay and we can undo)."""
     state["seq"] += 1
     state["history"].append({
         "seq": state["seq"], "t": time.time(), "actor": actor, "action": action,
         "caption": caption, "focus": focus or [], "model": copy.deepcopy(state["model"]),
-        "validation": summarize_validation(state.get("validation")),
+        "validation": summarize_validation(state.get("validation")), "animation": animation,
     })
 
 
@@ -60,6 +60,6 @@ def view(state: dict) -> dict:
     out = {k: state[k] for k in ("seq", "requirements", "messages", "questions", "validation",
                                  "next_steps", "agent_note", "stage")}
     out["model"] = bim.snapshot(state["model"])
-    out["history"] = [{**{k: h[k] for k in ("seq", "t", "actor", "action", "caption", "focus", "validation")},
+    out["history"] = [{**{k: h.get(k) for k in ("seq", "t", "actor", "action", "caption", "focus", "validation", "animation")},
                        "model": bim.snapshot(h["model"])} for h in state["history"]]
     return out

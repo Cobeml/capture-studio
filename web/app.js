@@ -58,7 +58,7 @@ async function loadCloud() {
   const pg = new THREE.BufferGeometry().setFromPoints(meta.cameras.map((c) => new THREE.Vector3(c[0], c[1], c[2])));
   pathLine = new THREE.Line(pg, new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.8 }));
   pathLine.visible = false; scene.add(pathLine);
-  frameCamera(-0.9, 0.82, 1.55, true);
+  frameCamera(-0.9, 0.95, 2.5, true);
 }
 
 function revealTo(frame) {
@@ -191,19 +191,19 @@ function setStage(s) {
   world.visible = s === 'bim' || s === 'design'; overlay.visible = s === 'design'; $('#labels').style.display = s === 'design' ? '' : 'none';
   anim = null;
   if (s === 'scan') { video.loop = true; video.playbackRate = 1; video.currentTime = 0; video.play().catch(() => {}); caption('Phone video of the site'); $('#stat').textContent = ''; }
-  if (s === 'cloud') { video.loop = false; video.currentTime = 0; video.playbackRate = 3; video.play().catch(() => {}); caption('LingBot-Map → point cloud'); frameCamera(-0.9, 0.9, 1.5); }
+  if (s === 'cloud') { video.loop = false; video.currentTime = 0; video.playbackRate = 3; video.play().catch(() => {}); caption('LingBot-Map → point cloud'); frameCamera(-0.9, 0.95, 2.5); }
   if (s === 'bim') {
     video.pause(); revealTo(1e9); groups.forEach((r) => world.remove(r.group)); groups.clear();
     const h0 = S?.history?.[0];
     if (h0) { applyModel(h0.model, { animate: true, stagger: 90 }); const c = count(h0.model);
       caption('Point cloud → as-built BIM'); $('#stat').textContent = `${c.wall} walls · ${c.door} doors · ${c.window} windows · scan fit P50 ${h0.model.scan?.fit_p50_mm ?? '–'} mm`; }
     else caption('No BIM yet — run fit_bim');
-    frameCamera(-0.9, 0.95, 1.45);
+    frameCamera(-0.9, 1.0, 2.4);
   }
   if (s === 'design') {
     video.pause(); revealTo(1e9); controls.autoRotate = false; $('#stat').textContent = '';
     if (S?.history?.length) { applyModel(S.history[0].model); queue = S.history.slice(1); shown = S.history.length; busyUntil = performance.now() + 700; pills(null); side(S, false); caption('Agent designs with you'); }
-    frameCamera(-1.15, 1.02, 1.4);
+    frameCamera(-1.15, 1.08, 2.3);
   }
 }
 const count = (m) => Object.values(m.elements).reduce((a, e) => (a[e.kind] = (a[e.kind] ?? 0) + 1, a), { wall: 0, door: 0, window: 0 });

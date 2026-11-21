@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import functools
 import inspect
+import os
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from . import bim, codes, physics, store
 
 mcp = FastMCP(
-    "capture-studio", host="127.0.0.1", port=8642, stateless_http=True, json_response=True,
+    "capture-studio", host="127.0.0.1", port=int(os.environ.get("CAPTURE_STUDIO_PORT", 8642)), stateless_http=True, json_response=True,
     instructions=(
         "Capture Studio turns a phone video of a construction site into an editable BIM model.\n"
         "Workflow: 1) reconstruct_scan  2) fit_bim (as-built shell, provenance=scanned)  "
@@ -350,7 +351,8 @@ def validate() -> dict:
     ph = v["physics"]
     store.record(s, "agent", "validate",
                  "All checks pass" if v["ok"] else f"{v['counts']['fail']} to fix · {v['counts']['hold']} to sign off",
-                 [i["element"] for i in v["issues"] if i["element"] and i["severity"] != "warn"])
+                 [i["element"] for i in v["issues"] if i["element"] and i["severity"] != "warn"],
+                 animation=ph["animation"] if (ph.get("animation") and not v["physics_ok"]) else None)
     store.save(s)
     out = _brief_validation(v)
     out["physics"] = {"bodies": ph["bodies"], "ties": ph["ties"], "clashes": ph["clashes"], "note": ph.get("note")}
