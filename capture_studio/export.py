@@ -70,7 +70,10 @@ def _ifc(model: dict, path):
             rep = f.create_entity("IfcShapeRepresentation", ContextOfItems=body, RepresentationIdentifier="Body",
                                   RepresentationType="SweptSolid", Items=items)
             ent.Representation = f.create_entity("IfcProductDefinitionShape", Representations=[rep])
-        run("spatial.assign_container", f, products=[ent], relating_structure=storey)
+        if e["kind"] == "space":        # spaces decompose the storey; physical elements are contained in it
+            run("aggregate.assign_object", f, products=[ent], relating_object=storey)
+        else:
+            run("spatial.assign_container", f, products=[ent], relating_structure=storey)
         props = {"Id": e["id"], "Provenance": e["provenance"], "Revision": f"R{model['revision']}"}
         if e.get("material"):
             props["Material"] = e["material"]
