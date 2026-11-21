@@ -29,7 +29,7 @@ def cloud_meta() -> dict | None:
     if not p.exists():
         return None
     m = json.loads(p.read_text())
-    return {k: m[k] for k in ("n", "frames", "fps", "ceiling_height", "scale", "scale_source", "extent_m", "inference_seconds")}
+    return {k: m.get(k) for k in ("n", "frames", "fps", "ceiling_height", "ceiling_source", "scale", "scale_source", "extent_m", "inference_seconds")}
 
 
 def set_scale_from_ceiling(h: float):
@@ -108,14 +108,26 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     C *= scale
 
     def ceiling_of(P):
-        # highest strong horizontal layer above head height (a hall's roof deck sits above lights and cranes)
+        """Soffit height: the highest distinct horizontal layer above head height. A forward-looking
+        walkthrough of a hall often never sees the roof, so fall back to the top of what was seen."""
         zz = P[(P[:, 2] > 1.9) & (P[:, 2] < 14.0), 2]
         hist, edges = np.histogram(zz, bins=np.arange(1.9, 14.0, 0.04))
-        hist = ndimage.gaussian_filter1d(hist.astype(float), 1.5)
-        strong = np.flatnonzero(hist >= 0.35 * hist.max())
-        return float(edges[int(strong[-1])] + 0.02)
+        hist = ndimage.gaussian_filter1d(hist.astype(float), 2.0)
+        peaks, _ = find_peaks(hist, prominence=0.25 * hist.max(), height=0.35 * hist.max())
+        if len(peaks):
+            return float(edges[int(peaks[-1])] + 0.02), "detected"
+        return float(np.clip(np.percentile(zz, 98), 2.6, 12.0)), "not observed — top of scanned geometry"
 
-    ceil = ceiling_of(P)
+    # floor at exactly z=0: refine the RANSAC offset with the mode of the lowest layer
+    hz, ez = np.histogram(P[(P[:, 2] > -0.5) & (P[:, 2] < 0.5), 2], bins=100)
+    dz = float(ez[int(np.argmax(ndimage.gaussian_filter1d(hz.astype(float), 2)))] + 0.005)
+    P[:, 2] -= dz
+    C[:, 2] -= dz
+    k0 = CAMERA_HEIGHT_M / float(np.median(C[:, 2]))
+    P *= k0
+    C *= k0
+    scale *= k0
+    ceil, ceil_source = ceiling_of(P)
     cal = SCAN / "calibration.json"
     if cal.exists():
         known = json.loads(cal.read_text())["ceiling_height_m"]
@@ -123,7 +135,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
         P *= k
         C *= k
         scale *= k
-        ceil, source = known, f"measured ceiling height {known} m"
+        ceil, source, ceil_source = known, f"measured ceiling height {known} m", "measured"
 
     # --- yaw: make the dominant wall direction axis-aligned
     cam_pts = C[f_idx]
@@ -175,7 +187,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
         "cameras": [[round(float(v), 3) for v in (*C[i], *fwd[i])] for i in range(S)],
         "center": [round(float(ext[0] / 2), 2), round(float(ext[1] / 2), 2), 1.0],
         "radius": round(float(np.linalg.norm(ext) / 2), 2), "extent_m": [round(float(v), 2) for v in ext],
-        "ceiling_height": round(ceil, 3), "view_clip": round(min(ceil - 0.2, 3.4), 2), "scale": round(scale, 5), "scale_source": source, "voxel_m": round(vox, 4),
+        "ceiling_height": round(ceil, 3), "ceiling_source": ceil_source, "view_clip": round(min(ceil - 0.2, 3.4), 2), "scale": round(scale, 5), "scale_source": source, "voxel_m": round(vox, 4),
         "inference_seconds": round(float(z["inference_seconds"]), 1),
     }
     (SCAN / "meta.json").write_text(json.dumps(meta))
@@ -296,8 +308,8 @@ def _openings_on_face(face, P, Cp, H, cell=0.05):
 
 def _equipment(P, colors, walls, H, cell=0.05, max_items=40):
     """Free-standing objects on the floor -> oriented boxes coloured from the scan."""
-    zmax = min(H - 0.4, 3.2)
-    m = (P[:, 2] > 0.25) & (P[:, 2] < zmax)
+    zmax = min(H - 0.3, 2.8)
+    m = (P[:, 2] > 0.5) & (P[:, 2] < zmax)            # above floor clutter, below services
     for w in walls:                                   # drop points belonging to walls
         a = np.array(w["start"]); b = np.array(w["end"]); d = b - a; L2 = float(d @ d)
         t = np.clip(((P[:, :2] - a) @ d) / L2, 0, 1)
@@ -310,9 +322,28 @@ def _equipment(P, colors, walls, H, cell=0.05, max_items=40):
     shape = ij.max(0) + 1
     cnt = np.zeros(shape, np.int32)
     np.add.at(cnt, (ij[:, 0], ij[:, 1]), 1)
-    occ = ndimage.binary_closing(cnt >= 3, structure=np.ones((5, 5)))
-    occ = ndimage.binary_opening(occ, structure=np.ones((3, 3)))
-    lab, n = ndimage.label(occ)
+    occ = ndimage.binary_opening(ndimage.binary_closing(cnt >= 3, structure=np.ones((3, 3))), structure=np.ones((3, 3)))
+    # cores = cells at least 20 cm inside a blob; every occupied cell joins its nearest core.
+    # Thin bridges (cables, noise streaks, touching neighbours) no longer weld machines together.
+    dist = ndimage.distance_transform_edt(occ)
+    cores, n = ndimage.label(dist >= 4)
+    _, (ni, nj) = ndimage.distance_transform_edt(cores == 0, return_indices=True)
+    lab = np.where(occ & (ndimage.distance_transform_edt(cores == 0) <= 7), cores[ni, nj], 0)
+    for thr in (8, 12):                               # blobs still larger than ~9 m2: split again with deeper cores
+        for k, sl in enumerate(ndimage.find_objects(lab), 1):
+            if sl is None:
+                continue
+            mk = lab[sl] == k
+            if mk.sum() * cell * cell < 9.0:
+                continue
+            sub, m_sub = ndimage.label(ndimage.distance_transform_edt(mk) >= thr)
+            if m_sub < 2:
+                continue
+            _, (si, sj) = ndimage.distance_transform_edt(sub == 0, return_indices=True)
+            new = sub[si, sj]
+            n_max = lab.max()
+            lab[sl] = np.where(mk, np.where(new > 1, n_max + new - 1, k), lab[sl])
+    n = int(lab.max())
     pl = lab[ij[:, 0], ij[:, 1]]
     out = []
     for k in range(1, n + 1):
@@ -322,7 +353,7 @@ def _equipment(P, colors, walls, H, cell=0.05, max_items=40):
         q = Q[sel]
         h = float(np.percentile(q[:, 2], 97))
         (cx, cy), (sx, sy), ang = cv2.minAreaRect(q[::max(1, len(q) // 5000), :2].astype(np.float32))
-        if sx * sy < 0.3 or h < 0.5 or min(sx, sy) < 0.3:
+        if sx * sy < 0.3 or h < 0.8 or min(sx, sy) < 0.35:
             continue
         if sx < sy:
             sx, sy, ang = sy, sx, ang + 90
@@ -343,6 +374,42 @@ def _equipment(P, colors, walls, H, cell=0.05, max_items=40):
                     "color": "#%02x%02x%02x" % tuple(int(x) for x in col)})
     out.sort(key=lambda e: -e["size"][0] * e["size"][1])
     return out[:max_items]
+
+
+def _close_perimeter(recs, P, C, lo, hi, H):
+    """A cluttered hall hides most of its walls behind plant. Close the shell as a rectangle through the
+    wall faces that *were* seen (else the extent of tall geometry); each side reports how much scan supports it."""
+    side_c = {}
+    for a, bound, sign in ((0, lo[0], 1), (0, hi[0], -1), (1, lo[1], 1), (1, hi[1], -1)):
+        cands = [r for r in recs if r["axis"] == a and abs(r["c"] - bound) < 1.0 and r["b1"] - r["b0"] >= 1.5]
+        L = sum(r["b1"] - r["b0"] for r in cands)
+        side_c[(a, sign)] = (sum(r["c"] * (r["b1"] - r["b0"]) for r in cands) / L if cands else bound - sign * 0.1, L)
+    out = []
+    for (a, sign), (c, seen) in side_c.items():
+        b0, b1 = side_c[(1 - a, 1)][0], side_c[(1 - a, -1)][0]
+        near = (np.abs(P[:, a] - (c + sign * 0.1)) < 0.12) & (P[:, 2] > 0.3) & (P[:, 1 - a] > b0) & (P[:, 1 - a] < b1)
+        res = np.abs(P[near, a] - np.median(P[near, a])) * 1000 if near.sum() > 50 else np.array([0.0])
+        covered = len(np.unique((P[near, 1 - a] / 0.25).astype(int))) * 0.25 / max(b1 - b0, 1e-6)
+        out.append({"axis": a, "c": float(c), "th": 0.2, "b0": float(b0), "b1": float(b1), "faces": [],
+                    "fit": {"p50": round(float(np.percentile(res, 50)), 1), "p95": round(float(np.percentile(res, 95)), 1), "n": int(near.sum())},
+                    "perimeter": True, "sign": sign, "scan_coverage": round(float(min(covered, 1.0)), 2)})
+    x0, x1 = side_c[(0, 1)][0], side_c[(0, -1)][0]
+    y0, y1 = side_c[(1, 1)][0], side_c[(1, -1)][0]
+    for r in recs:                       # keep real interior partitions only
+        (c0, c1), (d0, d1) = ((x0, x1), (y0, y1)) if r["axis"] == 0 else ((y0, y1), (x0, x1))
+        if c0 + 0.7 < r["c"] < c1 - 0.7 and r["b1"] - r["b0"] >= 2.0 and r["b0"] > d0 - 0.3 and r["b1"] < d1 + 0.3:
+            out.append(r)
+    # doorways: wherever the person filming walked through (or started at) a perimeter line
+    for r in out:
+        if not r.get("perimeter"):
+            continue
+        a, c = r["axis"], r["c"]
+        side = np.sign(C[:, a] - c)
+        hits = [float((C[i, 1 - a] + C[i + 1, 1 - a]) / 2) for i in range(len(C) - 1) if side[i] != side[i + 1]]
+        if abs(C[0, a] - c) < 1.0:
+            hits.append(float(C[0, 1 - a]))
+        r["walked_through"] = sorted({round(h, 1) for h in hits})
+    return out
 
 
 def fit_shell() -> tuple[dict, dict]:
@@ -389,6 +456,12 @@ def fit_shell() -> tuple[dict, dict]:
         recs.append({"axis": a, "c": c, "th": th, "b0": b0, "b1": b1, "faces": fs,
                      "fit": {"p50": round(float(np.percentile(res, 50)), 1), "p95": round(float(np.percentile(res, 95)), 1), "n": int(len(res))}})
 
+    tall = P[P[:, 2] > min(1.8, 0.6 * H)]
+    lo, hi = np.percentile(tall[:, :2], 1, axis=0), np.percentile(tall[:, :2], 99, axis=0)
+    perimeter_inferred = sum(r["b1"] - r["b0"] for r in recs) < 0.6 * 2 * float((hi - lo).sum())
+    if perimeter_inferred:
+        recs = _close_perimeter(recs, P, C, lo, hi, H)
+
     # corners: run wall ends into perpendicular walls they nearly meet
     for r in recs:
         for o in recs:
@@ -408,8 +481,15 @@ def fit_shell() -> tuple[dict, dict]:
         end = [r["c"], r["b1"]] if a == 0 else [r["b1"], r["c"]]
         w = bim.add(model, "wall", "scanned", name=f"Wall {chr(65 + k % 26)}{k // 26 or ''}",
                     start=[round(v, 2) for v in start], end=[round(v, 2) for v in end], thickness=r["th"],
-                    height=round(H, 2), material="masonry", fit=r["fit"], faces_seen=len(r["faces"]))
+                    height=round(H, 2), material="masonry", fit=r["fit"], faces_seen=len(r["faces"]),
+                    **({"exterior": True, "basis": "perimeter closed from partial scan", "scan_coverage": r["scan_coverage"]}
+                       if r.get("perimeter") else {"basis": "fitted"}))
         ops = []
+        for b in r.get("walked_through", []):
+            u = min(max(b - r["b0"] - 0.6, 0.1), bim.wall_length(w) - 1.3)
+            if all(abs(u - q["offset"]) > 1.5 for q in bim.openings_of(model, w["id"])):
+                doorish.append(bim.add(model, "door", "scanned", host=w["id"], offset=round(u, 2), width=1.2, sill=0.0,
+                                       height=2.1, basis="camera path passes through"))
         for f in r["faces"]:
             for o in _openings_on_face(f, P, Cp, H):
                 u0, u1 = o["u0"] + f["b0"] - r["b0"], o["u1"] + f["b0"] - r["b0"]
@@ -441,6 +521,10 @@ def fit_shell() -> tuple[dict, dict]:
     colors = (np.fromfile(cb, dtype=np.uint8)[len(P) * 12:].reshape(-1, 3) if cb.exists()
               else np.full((len(P), 3), 150, np.uint8))
     eq = _equipment(P, colors, ws, H)
+    if perimeter_inferred:
+        x0, x1 = min(w["start"][0] for w in ws), max(w["end"][0] for w in ws)
+        y0, y1 = min(w["start"][1] for w in ws), max(w["end"][1] for w in ws)
+        eq = [e for e in eq if x0 < e["pos"][0] < x1 and y0 < e["pos"][1] < y1]
     names = {"machine": "Machine", "rack": "Rack", "bench": "Bench"}
     for i, e in enumerate(eq):
         n = sum(x["category"] == e["category"] for x in eq[:i]) + 1
@@ -459,5 +543,6 @@ def fit_shell() -> tuple[dict, dict]:
         "fit_p95_mm": round(float(max(f["p95"] for f in fits)), 1) if fits else None,
     }
     counts = bim.summary(model)["counts"]
+    model["scan"]["perimeter"] = "closed from partial scan (walls hidden behind equipment)" if perimeter_inferred else "fitted"
     return model, {"counts": counts, "ceiling_height_m": round(H, 2), "scan": model["scan"],
                    "note": "Scale is an assumption until one dimension is tape-checked (set_scale)."}
