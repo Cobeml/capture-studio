@@ -11,7 +11,8 @@ Stages (each cached under data/scan/objects_work/ so a re-run only redoes what c
               every voxel is then voted to at most one object -> cloud_labels.bin.
   5. label    per object the 2-3 best views (crops + outlined full frame) -> Gemini -> label / category /
               function JSON (then human-reviewed overrides from objects_work/review.json are applied).
-  6. hero     a few well-observed objects get a completed, coloured 3D model -> objects.glb.
+  6. hero     one or two hero objects get a high-fidelity textured 3D model (capture_studio/hero.py ->
+              objects.glb); a re-run here keeps heroes that were already built.
 """
 from __future__ import annotations
 
@@ -669,7 +670,7 @@ def _shrink_overlaps(objs, P, pl, thr=0.3):
                     o["tight"] = True
 
 
-def run(labels_from: str | None = None, hero: list[str] | None = None, write_previews=True) -> dict:
+def run(labels_from: str | None = None, write_previews=True) -> dict:
     T = {}
     t0 = time.time()
     meta, P, col = read_cloud()
@@ -731,7 +732,7 @@ def run(labels_from: str | None = None, hero: list[str] | None = None, write_pre
     else:
         labels = label_objects(objs, frames, masks)
     T["label"] = time.time() - t0 - sum(T.values())
-    hero = set(hero or [])
+    hero = set()
     out = []
     for o in objs:
         lb = dict(labels.get(o["source_key"], {}))
@@ -781,6 +782,12 @@ def run(labels_from: str | None = None, hero: list[str] | None = None, write_pre
         pv.mkdir(exist_ok=True)
         for o in objs:
             preview_montage(o, frames, masks, pv / f"{o['key']}.jpg")
+    built = sorted(p.name[5:] for p in work_dir().glob("hero_*") if (p / "hero.json").exists())
+    built = [k for k in built if any(o["key"] == k for o in out)]
+    if built:                                       # keep hero models already built (capture_studio.hero)
+        from . import hero as hero_mod
+        hero_mod.write_outputs(built)
+        doc = json.loads((sd / "objects.json").read_text())
     T["write"] = time.time() - t0 - sum(T.values())
     print("stage seconds:", {k: round(v, 1) for k, v in T.items()})
     return doc
@@ -790,13 +797,47 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--labels-from", help="objects.json or {key: {label, category, function, confidence}} "
                                           "to reuse instead of calling Gemini")
-    ap.add_argument("--hero", default="", help="comma-separated object keys that get a 3D model (objects.glb)")
     ap.add_argument("--no-previews", action="store_true")
     a = ap.parse_args()
-    doc = run(a.labels_from, [k for k in a.hero.split(",") if k], not a.no_previews)
+    doc = run(a.labels_from, not a.no_previews)
     for o in doc["objects"]:
         print(f"{o['key']}  {o['label']:<45} {o['category']:<8} {o['points']:>7} pts  {o['label_source']}")
 
 
 if __name__ == "__main__":
     main()
+
+
+def transfer_labels(old_P, old_lab, new_P, radius=0.03):
+    """Carry per-point object labels over to a re-built cloud without re-segmenting (object poses stay
+    exactly as they were): each new point takes the label of the nearest old point within `radius`,
+    floor points stay 0."""
+    from scipy.spatial import cKDTree
+    tree = cKDTree(old_P)
+    d, j = tree.query(new_P, k=1, distance_upper_bound=radius)
+    lab = np.zeros(len(new_P), np.uint16)
+    ok = np.isfinite(d)
+    lab[ok] = old_lab[j[ok]]
+    lab[new_P[:, 2] < FLOOR_Z] = 0
+    return lab
+
+
+def refresh_after_cloud_change(old_P, old_lab):
+    """After prepare_cloud() rebuilt cloud.bin: transfer labels, update per-object point stats
+    (counts / AABB) in objects.json; positions, sizes, yaw, keys and labels are untouched."""
+    meta, P, col = read_cloud()
+    lab = transfer_labels(old_P, old_lab, P)
+    sd = scan_dir()
+    lab.tofile(sd / "cloud_labels.bin")
+    doc = json.loads((sd / "objects.json").read_text())
+    for o in doc["objects"]:
+        m = lab == o["index"]
+        if m.any():
+            q = P[m]
+            o["points"] = o["point_count"] = int(m.sum())
+            o["bbox_min"] = [round(float(v), 3) for v in q.min(0)]
+            o["bbox_max"] = [round(float(v), 3) for v in q.max(0)]
+    (sd / "objects.json").write_text(json.dumps(doc, indent=1))
+    meta["objects"] = len(doc["objects"])
+    (sd / "meta.json").write_text(json.dumps(meta))
+    return int((lab > 0).sum())

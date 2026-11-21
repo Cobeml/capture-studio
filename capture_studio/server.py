@@ -749,6 +749,39 @@ async def api_answer(r: Request):
     return JSONResponse({"ok": True})
 
 
+@mcp.custom_route("/api/upload", methods=["POST"])
+async def api_upload(r: Request):
+    """Upload a walkthrough video (raw request body; ?name=file.mov&site_type=factory) and start the live pipeline."""
+    from . import jobs
+    if jobs.read().get("state") == "running":
+        return JSONResponse({"error": "a pipeline run is already in progress"}, status_code=409)
+    name = "".join(c for c in r.query_params.get("name", "upload.mp4") if c.isalnum() or c in "._-")[-80:] or "upload.mp4"
+    up = store.DATA / "uploads"
+    up.mkdir(parents=True, exist_ok=True)
+    dest = up / f"{int(time.time())}_{name}"
+    size = 0
+    with open(dest, "wb") as f:
+        async for chunk in r.stream():
+            size += len(chunk)
+            if size > 2_000_000_000:
+                f.close()
+                dest.unlink(missing_ok=True)
+                return JSONResponse({"error": "file larger than 2 GB"}, status_code=413)
+            f.write(chunk)
+    if size < 10_000:
+        dest.unlink(missing_ok=True)
+        return JSONResponse({"error": "empty upload"}, status_code=400)
+    title = r.query_params.get("title") or name.rsplit(".", 1)[0].replace("_", " ")
+    return JSONResponse(jobs.start(str(dest), name=title, site_type=r.query_params.get("site_type", "factory")))
+
+
+@mcp.custom_route("/api/job", methods=["GET"])
+async def api_job(_: Request):
+    """Progress of the live pipeline (stage list with states, timings and results)."""
+    from . import jobs
+    return JSONResponse(jobs.read(), headers={"Cache-Control": "no-store"})
+
+
 def main():
     mcp.run(transport="stdio" if "--stdio" in sys.argv else "streamable-http")
 

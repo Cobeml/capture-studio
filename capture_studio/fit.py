@@ -70,6 +70,7 @@ def _normals(P, cams_of_points, radius):
 # 3) prepare_cloud(): full-resolution fused pixels -> frozen model frame -> 1 cm voxel average.
 
 REFINE_SIGMA_T, REFINE_SIGMA_R, REFINE_SIGMA_ICP = 0.03, 0.02, 0.004    # raw units (~x3.8 = metres), radians
+NEAR_M = 3.0          # within this range of the camera the consistency test is relaxed (see dense_pixels)
 
 
 def load_frame() -> dict | None:
@@ -152,7 +153,7 @@ def refine_frames(z=None, force=False) -> np.ndarray:
     return Ts
 
 
-def dense_pixels(z, Ts=None, tau=0.015, nbrs=(1, 2, 3), min_cons=2, min_conf=1.2):
+def dense_pixels(z, Ts=None, tau=0.015, nbrs=(1, 2, 3), min_cons=2, min_conf=1.2, near_raw=0.0):
     """Multi-view consistency filter + fusion of LingBot's per-pixel points (GPU if available).
 
     Returns (P (S,H,W,3) float32 fused points in *raw* coordinates, keep (S,H,W) bool, n_cons (S,H,W) uint8)."""
@@ -198,8 +199,13 @@ def dense_pixels(z, Ts=None, tau=0.015, nbrs=(1, 2, 3), min_cons=2, min_conf=1.2
                 acc[cons] += pts[j, vv[cons], uu[cons]]
                 cnt += cons.float()
         nc = cnt - 1
-        k = (conf[i].reshape(-1) > min_conf) & ~edge[i].reshape(-1) & (D[i].reshape(-1) > 0) & \
-            (nc >= min_cons) & (nviol <= nc / 2)
+        di = D[i].reshape(-1)
+        # near the camera, neighbouring frames disagree most (fast parallax, close-up depth jitter), so
+        # demanding two agreeing neighbours hollows out the machine right next to the phone: there one
+        # agreeing neighbour (or, very close and confident, none but also no contradiction) is enough
+        cons_ok = (nc >= min_cons) | ((di < near_raw) & (nc >= 1)) | \
+                  ((di < 0.6 * near_raw) & (conf[i].reshape(-1) > 3.0) & (nviol == 0))
+        k = (conf[i].reshape(-1) > min_conf) & ~edge[i].reshape(-1) & (di > 0) & cons_ok & (nviol <= nc / 2)
         out[i] = (acc / cnt[:, None]).reshape(H, W, 3)
         keep[i] = k.reshape(H, W)
         ncons[i] = nc.clamp(max=255).to(torch.uint8).reshape(H, W)
@@ -215,7 +221,11 @@ def model_pixels(z=None, refine=True):
     """Per-pixel fused points in the model frame + validity, for segmentation (objects.py)."""
     z = z if z is not None else np.load(SCAN / "raw_predictions.npz")
     frame = load_frame()
-    Ts = refine_frames(z) if refine else None
+    try:
+        Ts = refine_frames(z) if refine else None
+    except Exception as ex:      # e.g. a blurred frame with no confident points: fuse with LingBot's own poses instead
+        print(f"frame refinement skipped ({type(ex).__name__}: {str(ex)[:120]})")
+        Ts = None
     P, keep, ncons = dense_pixels(z, Ts)
     S, H, W, _ = P.shape
     Pm = to_model(P.reshape(-1, 3), frame).astype(np.float32).reshape(S, H, W, 3)
@@ -245,15 +255,31 @@ def prepare_cloud(max_points=4_500_000, voxel=0.008, refine=True) -> dict:
     upv = up_cam.copy()
     o3d.utility.random.seed(0)                     # deterministic RANSAC: refits land in the same frame
 
-    Ts = refine_frames(z) if refine else None
-    Pd, keep, _ = dense_pixels(z, Ts)
+    try:
+        Ts = refine_frames(z) if refine else None
+    except Exception as ex:      # e.g. a blurred frame with no confident points: fuse with LingBot's own poses instead
+        print(f"frame refinement skipped ({type(ex).__name__}: {str(ex)[:120]})")
+        Ts = None
+    if Ts is not None:
+        # the published camera path must be the one the cloud is consistent with: refined poses
+        # (w2c' = w2c @ T^-1). The refinement keeps the trajectory's best rigid fit on LingBot's.
+        Ri = np.transpose(Ts[:, :3, :3], (0, 2, 1))
+        R2 = R @ Ri
+        t2 = np.einsum("sij,sj->si", R, -np.einsum("sij,sj->si", Ri, Ts[:, :3, 3])) + t
+        C_raw = -np.einsum("sji,sj->si", R2, t2)
+        fwd, up_cam = R2[:, 2, :], -R2[:, 1, :]
+        upv = up_cam.copy()
+    frame = load_frame()
+    near = NEAR_M / float(frame["s"]) if frame is not None else 0.0
+    Pd, keep, _ = dense_pixels(z, Ts, near_raw=near)
     f_idx = np.broadcast_to(np.arange(S)[:, None, None], keep.shape)[keep]
     P = Pd[keep].astype(np.float64)
     col = rgb[keep]
     del Pd
-    frame = load_frame()
     if frame is not None:
         return _finish_cloud(z, frame, P, col, f_idx, C_raw, fwd, upv, max_points, voxel)
+    C = C_raw.copy()                               # (frame estimation below works on the published path)
+    fwd_pub, up_pub = fwd.copy(), up_cam.copy()
 
     P_raw = P.copy()
     # --- no frame.json yet: estimate one (gravity, scale, yaw, origin), then freeze it
@@ -343,7 +369,7 @@ def prepare_cloud(max_points=4_500_000, voxel=0.008, refine=True) -> dict:
              "ceiling_source": ceil_source, "scale_source": source, "extent_m": [round(float(v), 2) for v in ext],
              "note": "x_model = s * R @ x_raw + t"}
     (SCAN / "frame.json").write_text(json.dumps(frame))
-    return _finish_cloud(z, frame, P_raw, col, f_idx, C_raw, R[:, 2, :], up_cam, max_points, voxel)
+    return _finish_cloud(z, frame, P_raw, col, f_idx, C_raw, fwd_pub, up_pub, max_points, voxel)
 
 
 def _finish_cloud(z, frame, P_raw, col, f_idx, C_raw, fwd_raw, up_raw, max_points, voxel) -> dict:
@@ -414,6 +440,7 @@ def _finish_cloud(z, frame, P_raw, col, f_idx, C_raw, fwd_raw, up_raw, max_point
         "view_clip": round(min(ceil - 0.2, 3.4), 2), "scale": round(s_, 5),
         "scale_source": frame.get("scale_source", ""), "voxel_m": round(vox, 4),
         "inference_seconds": round(float(z["inference_seconds"]), 1),
+        "cameras_source": "LingBot-Map poses refined by the ICP pose graph (frame_refine.npz): the cloud is consistent with these",
         "cloud": {"method": "LingBot-Map full-res pixels, ICP pose-graph frame refinement, multi-view consistency "
                             "filter + fusion, voxel average", "frame": "frame.json (frozen)"},
     }

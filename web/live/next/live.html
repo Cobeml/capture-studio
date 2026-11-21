@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:,">
+  <title>Capture Studio · Live</title>
+  <!-- Base look (tokens, masthead, wordmark, pill + round buttons, gallery controls) is the teammate's
+       library.css, copied unchanged from github.com/deanhu0822/capture-studio (commit 7c7d5a0). -->
+  <link rel="stylesheet" href="../teammate/library.css">
+  <link rel="stylesheet" href="live.css">
+</head>
+<body data-stage="capture" data-mode="live">
+  <header class="masthead">
+    <a class="wordmark" href="#capture" aria-label="Capture Studio">
+      <span class="studio-mark" aria-hidden="true"><b></b><b></b><b></b></span>
+      Capture Studio
+    </a>
+    <nav id="stage-nav" aria-label="Demo stages">
+      <a href="#capture" data-s="capture">Capture</a>
+      <a href="#cloud" data-s="cloud">Reconstruct</a>
+      <a href="#bim" data-s="bim">Rebuild</a>
+      <a href="#explore" data-s="explore">Understand</a>
+      <a href="#design" data-s="design">Design</a>
+      <a href="#deliver" data-s="deliver">Deliver</a>
+    </nav>
+    <div class="mast-actions">
+      <span id="agent-state" class="agent-state" title="Inferred from changes in the project state"><i></i><span>Agent idle</span></span>
+      <span id="live-tag" class="live-tag"><i></i><span>LIVE</span></span>
+      <button id="btn-auto" class="button secondary" aria-pressed="true" title="Steps advance as data lands (click to stop)"><i></i>Auto-advance</button>
+      <button id="btn-upload" class="button primary">Upload new video</button>
+      <button id="btn-replay" class="button secondary" title="Play the recorded design run">Replay run</button>
+      <button id="btn-reset" class="button secondary" title="Back to the as-built model (local playback only)">Reset</button>
+    </div>
+  </header>
+
+  <main id="main-content">
+    <header class="stage-title">
+      <h1 id="title"></h1>
+      <p id="lede"></p>
+      <div id="rail" class="pipe" aria-label="Pipeline progress"></div>
+    </header>
+
+    <div class="bench">
+      <section id="viewport" class="viewport" aria-label="Stage view">
+        <canvas id="gl"></canvas>
+        <div id="pane-video" class="pane"><span>Phone video</span></div>
+        <div id="pane-fpv" class="pane"><span>Point cloud · same moment, first person</span></div>
+        <div id="pane-top" class="pane"><span>Top down · as it is reconstructed</span></div>
+        <div id="recbar" class="recbar">
+          <button id="rec-play" class="button primary small">Pause</button>
+          <input id="rec-scrub" type="range" min="0" max="1" step="0.0005" value="0" aria-label="Scrub the video">
+          <span id="rec-time" class="mono-label">0:00</span>
+          <span id="rec-speed" class="rec-speed"><button data-x="1">1×</button><button data-x="2" aria-pressed="true">2×</button><button data-x="4">4×</button></span>
+        </div>
+        <video id="video" src="/data/site.mp4" muted playsinline loop preload="auto"></video>
+        <div id="labels"></div>
+        <div id="olabels"></div>
+        <div id="tip" class="tip" hidden></div>
+        <div id="info" class="info" hidden></div>
+        <div id="viewsw" class="viewsw" role="group" aria-label="View">
+          <button data-v="cloud" aria-pressed="false">Point cloud</button><button data-v="blend" aria-pressed="false">Blend</button><button data-v="model" aria-pressed="true">Model</button>
+          <span class="sep"></span>
+          <button id="sw-seg" aria-pressed="false">Segments</button><button id="sw-labels" aria-pressed="true">Labels</button>
+        </div>
+        <div id="vp-caption" class="vp-caption"><b id="vp-tag"></b><span></span></div>
+        <div id="pills" class="pills">
+          <span class="pill" id="p-code"><i></i>Code</span><span class="pill" id="p-safety"><i></i>Safety</span>
+          <span class="pill" id="p-physics"><i></i>Physics</span><span class="pill" id="p-wishes"><i></i>Wishes</span><span class="pill" id="p-review" hidden title="Independent review by a second model (validation.review)"><i></i>Review</span>
+        </div>
+        <div id="wipe" class="wipe"><span class="wl">Scan</span><button id="wipe-knob" aria-label="Drag to compare scan and model">⟷</button><span class="wr">Model</span></div>
+        <div id="vp-note" class="vp-note"></div>
+        <div id="signoff" class="signoff" hidden>
+          <div class="so-kicker">Sign-off needed · the agent is asking you</div>
+          <p id="so-q"></p>
+          <div id="so-opts" class="so-opts"></div>
+          <div id="so-foot" class="so-foot"></div>
+        </div>
+        <div id="loading" class="loading">Loading…</div>
+        <div id="waiting" class="waiting" hidden><div class="spin"></div><h3></h3><p></p></div>
+        <div id="drop" class="drop" hidden>
+          <div class="drop-card">
+            <h3>Upload a walkthrough video</h3>
+            <p>One continuous walk through the space, about 1–2 minutes, phone held steady. Portrait or landscape.</p>
+            <label class="button primary big">Choose video<input id="drop-file" type="file" accept="video/*" hidden></label>
+            <span class="fine">or drop a file here</span>
+            <div id="drop-bar" class="drop-bar"><b></b></div>
+            <div id="drop-msg" class="fine"></div>
+            <button id="drop-cancel" class="link-btn" type="button">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <aside id="inspector" class="inspector">
+        <!-- 01 capture -->
+        <div class="panel" data-for="capture">
+          <div class="facts" id="cap-facts"></div>
+          <div class="thumbs" id="thumbs"></div>
+          <p class="fine">Uploaded by you · processed on this server.</p>
+        </div>
+        <!-- 02 reconstruct -->
+        <div class="panel" data-for="cloud">
+          <div class="facts" id="cloud-facts"></div>
+          <p class="fine" id="cloud-fine"></p>
+          <button class="button secondary" id="btn-recloud">↺ Replay reconstruction</button>
+        </div>
+        <!-- 03 rebuild -->
+        <div class="panel" data-for="bim">
+          <div class="facts" id="bim-facts"></div>
+          <p class="fine" id="bim-fine"></p>
+          <button class="button secondary" id="btn-rebim">↺ Rebuild again</button>
+        </div>
+        <!-- 04 understand -->
+        <div class="panel" data-for="explore">
+          <div class="facts" id="ex-facts"></div>
+          <div class="ex-heroes" id="ex-heroes"></div>
+          <p class="fine" id="ex-hint"></p>
+          <div id="ex-sel" class="ex-sel"></div>
+        </div>
+        <!-- hero inspector (overrides the stage panel while open) -->
+        <div class="panel panel-hero" id="hero">
+          <div class="hero-head"><span class="mono-label">Generated 3D model · drag to orbit</span><button id="hero-close" class="link-btn">Close ×</button></div>
+          <canvas id="hero-gl"></canvas>
+          <h3 id="hero-title"></h3>
+          <p id="hero-fn" class="fine"></p>
+          <div id="hero-meta" class="hero-meta"></div>
+          <div class="mono-label">Parts</div>
+          <ul id="hero-parts" class="hero-parts"></ul>
+          <form id="hero-form" class="brief">
+            <label for="hero-prompt" class="mono-label">Edit this machine with the agent</label>
+            <textarea id="hero-prompt" rows="2"></textarea>
+            <div class="brief-actions"><button class="button primary" id="hero-send" type="submit">Send edit request →</button></div>
+          </form>
+        </div>
+        <!-- 05 design -->
+        <div class="panel panel-design" data-for="design">
+          <form id="brief" class="brief">
+            <label for="brief-text" class="mono-label">Brief to the agent</label>
+            <div id="mentions" class="mentions"></div>
+            <textarea id="brief-text" rows="3">Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.</textarea>
+            <div id="suggest" class="suggest"></div>
+            <div class="brief-actions">
+              <button class="button primary big" id="btn-send" type="submit">Send to agent →</button><span class="rec-tag live">LIVE · sent to the agent on this server</span>
+              <button class="button secondary" id="btn-replay2" type="button">Replay recorded</button>
+            </div>
+          </form>
+          <div id="hint" class="hint-card" hidden>
+            <b>No agent activity yet.</b> Start the agent in a terminal:
+            <code id="hint-cmd">source .venv/bin/activate &amp;&amp; python scripts/agent_gemini.py --watch --route auto</code>
+            <span class="hint-actions"><button class="button secondary small" id="btn-copy" type="button">Copy command</button><button class="button secondary small" id="btn-replay3" type="button">Replay recorded instead</button></span>
+          </div>
+          <div id="scen-wrap" class="scen-wrap" hidden>
+            <span class="mono-label">Pre-generated scenarios · instant, then replayed</span>
+            <div id="scen" class="scen-row"></div>
+          </div>
+          <div class="tiers" title="Gemini model tiers, routed by task difficulty (agent_gemini.py --route auto)">
+            <span class="mono-label">Gemini tiers · intelligence by task difficulty</span>
+            <div class="tier-row">
+              <span class="tier"><b>Carbon</b><small>plan · fix</small></span>
+              <span class="tier"><b>Neon</b><small>edit</small></span>
+              <span class="tier"><b>Argon</b><small>sign-off</small></span>
+              <span class="tier"><b>Hydrogen</b><small>read · wrap up</small></span>
+            </div>
+          </div>
+          <div class="feed-head"><span class="mono-label">Agent activity</span><span id="feed-src" class="mono-label dim"></span><button id="btn-skip" class="link-btn" hidden>Skip to end ▸▸</button></div>
+          <ol id="feed" class="feed"></ol>
+        </div>
+        <!-- 06 deliver: what the recorded run really produced -->
+        <div class="panel panel-deliver" data-for="deliver">
+          <div class="checks" id="dl-checks"></div>
+          <div class="mono-label">Client requirements</div>
+          <ul id="dl-reqs" class="dl-list"></ul>
+          <div class="mono-label">Site actions before installation</div>
+          <ul id="dl-warn" class="dl-list"></ul>
+          <div class="mono-label">Added by the agent</div>
+          <ul id="dl-added" class="dl-list"></ul>
+          <p class="fine">LIVE · from this project, computed just now</p>
+          <div hidden><ol id="next"></ol><div id="qty"></div><ul id="files"></ul><span id="export-status"></span><button id="btn-export"></button><div id="review"></div></div>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="controls">
+      <div class="position"><span id="pos">01</span><span class="position-line" aria-hidden="true"></span><span id="pos-n">06</span></div>
+      <div class="keys">← → or space</div>
+      <div class="ctl-actions">
+        <button id="btn-back" class="round-button" aria-label="Previous stage"><span aria-hidden="true">←</span></button>
+        <button id="btn-next" class="button primary big">Next →</button>
+      </div>
+    </footer>
+  </main>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">Reset the demo?</h2>
+      <p>This discards the current design and refits the as-built model from the scan (<code>fit_bim</code>, <code>reset_design: true</code>). The recorded session stays available through <em>Replay recorded session</em>.</p>
+      <div class="modal-actions"><button class="button secondary" id="modal-no">Cancel</button><button class="button primary" id="modal-yes">Reset to as-built</button></div>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <div id="cursor"><svg width="22" height="22" viewBox="0 0 22 22"><path d="M2 1.5 L2 18 L6.6 13.8 L9.6 20.5 L12.6 19.2 L9.7 12.6 L16 12.4 Z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
+
+  <script type="importmap">{ "imports": { "three": "/web/vendor/three.module.js" } }</script>
+  <script type="module" src="live.js"></script>
+</body>
+</html>

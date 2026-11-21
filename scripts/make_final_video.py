@@ -101,6 +101,27 @@ VO = [
     dict(id="end", text="Capture Studio. From phone video to a buildable plan."),
 ]
 
+# v2 recut (segmented point cloud instead of box models; no export / IFC claim)
+VO_V2 = [
+    dict(id="intro", text="This is Capture Studio."),
+    dict(id="walk", text="Walk a factory floor with your phone."),
+    dict(id="cloud", text="LingBot-Map turns the video into a dense 3D point cloud.",
+         qwen="LingBot Map turns the video into a dense three-D point cloud."),
+    dict(id="scene", text="Then Gemini reads the scene: every machine segmented, named, and understood."),
+    dict(id="cnc", text="Ask for a change, and a Gemini agent designs it with you: placing machines, guarding them, "
+                        "keeping exit routes clear, and running a physics test in MuJoCo on every change.",
+         qwen="Ask for a change, and a Gemini agent designs it with you: placing machines, guarding them, "
+              "keeping exit routes clear, and running a physics test in Moo-Joe-Co on every change."),
+    dict(id="risky", text="Anything risky, it asks you first."),
+    dict(id="intel", text="Intelligence is matched to the task: Gemini Carbon for the hard design decisions, with Neon, "
+                          "Argon and Hydrogen for the lighter steps.",
+         qwen="Intelligence is matched to the task: Gemini Carbon, for the hard design decisions, with Neon, Argon "
+              "and Hydrogen for the lighter steps."),
+    dict(id="end", text="Capture Studio. From phone video to a buildable plan."),
+]
+CUT = "v1"
+TTS_SUFFIX = ""
+
 QWEN_TAKES = 4
 QWEN_INSTRUCT = ("Confident, warm documentary narrator for a product launch film. Clear, natural and steady pace, "
                  "slight energy, no exaggeration.")
@@ -109,7 +130,26 @@ QWEN_INSTRUCT = ("Confident, warm documentary narrator for a product launch film
 VO_START = 10.30          # "This is Capture Studio." starts over the title card
 END_CARD_MAX = 56.70      # end card fades in (moved earlier if the last line is long); last line starts after it
 END_CARD = END_CARD_MAX
-GAP_AFTER = dict(intro=0.30, walk=0.30, cloud=0.35, bim=0.35, agent=0.30, cnc=0.35, risky=0.35, intel=0.35, ifc=0.0)
+GAP_AFTER = dict(intro=0.30, walk=0.30, cloud=0.35, bim=0.35, agent=0.30, cnc=0.35, risky=0.35, intel=0.35, ifc=0.0,
+                 scene=0.35)
+SPARE_AFTER = ("risky", 1.2)    # (chunk id, max seconds): unused VO time is given to the shot after this line
+EXTRA_GAP_W = dict(intro=0.3, walk=0.3, cloud=0.5, cnc=0.8, risky=0.6, intel=0.5)   # v2 only
+
+
+def use_cut(cut):
+    """Switch every output path / VO table to the v2 recut (v1 files stay untouched)."""
+    global CUT, VO, TTS_SUFFIX, OUT, OUT_NOMUSIC, CACHE, SPARE_AFTER, FOLLOW_DIRS, STAGE_DIRS
+    CUT = cut
+    if cut != "v2":
+        return
+    VO = VO_V2
+    TTS_SUFFIX = "_v2"
+    OUT = FINAL / "capture_studio_1min_v2.mp4"
+    OUT_NOMUSIC = FINAL / "capture_studio_1min_v2_nomusic.mp4"
+    CACHE = FINAL / "cache_v2"
+    SPARE_AFTER = ("scene", 2.5)  # spare time goes to the segmentation centrepiece
+    FOLLOW_DIRS = [FINAL / "rec" / "v2_follow"]
+    STAGE_DIRS = [FINAL / "rec" / "v2_stages"]
 
 # --------------------------------------------------------------------------------------
 # Part 1 sources: public domain (US Gov / Prelinger) and Pexels-licensed modern footage.
@@ -263,7 +303,7 @@ def _reexec(venv: Path, argv):
     if not py.exists():
         sys.exit(f"missing venv {venv}; see header of this script")
     env = dict(os.environ, HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
-    return subprocess.run([str(py), str(Path(__file__).resolve())] + argv, env=env).returncode
+    return subprocess.run([str(py), str(Path(__file__).resolve())] + argv + ["--cut", CUT], env=env).returncode
 
 
 def say_text(chunk, engine):
@@ -280,7 +320,7 @@ def tts(engine, voice, speed=1.0):
     import numpy as np
     import soundfile as sf
     import torch
-    outdir = TTSDIR / f"{engine}_{voice}"
+    outdir = TTSDIR / f"{engine}_{voice}{TTS_SUFFIX}"
     outdir.mkdir(parents=True, exist_ok=True)
     if engine == "kokoro":
         from kokoro import KPipeline
@@ -312,7 +352,7 @@ def tts(engine, voice, speed=1.0):
     sr = chunks[0][1]
     gap = np.zeros(int(0.35 * sr), dtype=np.float32)
     full = np.concatenate([np.concatenate([c[0].astype(np.float32), gap]) for c in chunks])
-    sf.write(TTSDIR / f"{engine}_{voice}.wav", full, sr)
+    sf.write(TTSDIR / f"{engine}_{voice}{TTS_SUFFIX}.wav", full, sr)
 
 
 def _norm_words(s):
@@ -480,7 +520,7 @@ def build_vo(voice):
     import numpy as np
     import soundfile as sf
     engine, vname = voice.split(":", 1)
-    name = f"{engine}_{vname}"
+    name = f"{engine}_{vname}{TTS_SUFFIX}"
     d = TTSDIR / name
     rep = json.loads((d / "align.json").read_text())
     chunks, offs, nclicks = [], [], 0
@@ -504,6 +544,13 @@ def build_vo(voice):
         chunks[:-1] = [time_stretch(c, factor) for c in chunks[:-1]]
     gaps = {k: v / factor for k, v in GAP_AFTER.items()}
     spare = avail - (sum(len(c) for c in chunks[:-1]) / SR + sum(gaps[c["id"]] for c in VO[:-1]))
+    if CUT == "v2" and spare > SPARE_AFTER[1]:
+        # v2 script is shorter: after the centrepiece hold, spread what is left over the other pauses
+        rest = spare - SPARE_AFTER[1]
+        tot_w = sum(EXTRA_GAP_W.values())
+        for k, wgt in EXTRA_GAP_W.items():
+            gaps[k] = gaps.get(k, 0) + min(1.0, rest * wgt / tot_w)
+        log(f"v2: {spare:.2f}s spare -> {SPARE_AFTER[1]}s after {SPARE_AFTER[0]}, rest over pauses")
     total = np.zeros(int(DUR * SR), dtype=np.float32)
     t = VO_START
     timeline = []
@@ -524,12 +571,12 @@ def build_vo(voice):
         timeline.append(dict(id=c["id"], text=c["text"], start=round(t, 3), end=round(t + len(a) / SR, 3),
                              words=words))
         t += len(a) / SR + gaps.get(c["id"], 0)
-        if c["id"] == "risky" and spare > 0:   # give spare time to the model-ladder graphic
-            t += min(spare, 1.2)
+        if c["id"] == SPARE_AFTER[0] and spare > 0:   # give spare time to the shot after this line
+            t += min(spare, SPARE_AFTER[1])
     # polish whole track: gentle compression, then peak-normalise to -3 dBFS (loudness set in the mix)
     total = compress(total, thr_db=-22, ratio=2.5, att=0.004, rel=0.15)
     total *= 10 ** (-3 / 20) / max(1e-6, np.abs(total).max())
-    sf.write(FINAL / "vo.wav", np.stack([total, total], 1), SR, subtype="PCM_24")
+    sf.write(FINAL / f"vo{TTS_SUFFIX}.wav", np.stack([total, total], 1), SR, subtype="PCM_24")
     (CACHE / "vo_timeline.json").write_text(json.dumps(dict(voice=voice, tempo=factor, declicked=nclicks,
                                                             chunks=timeline), indent=1))
     log(f"vo.wav written (tempo x{factor:.3f}, {nclicks} clicks repaired)")
@@ -1009,6 +1056,16 @@ DESIGN_PRESETS = {
                 end=(0.45, 0.50, 1.45)),
     ),
 }
+# v2: Gemini 4 Carbon session on the segmented model, recorded read-only from the live project server:
+# `record_demo.py demo/final/rec/v2_stages http://127.0.0.1:8642 --no-hitl --stages cloud,understand,design`
+DESIGN_PRESETS["v2"] = dict(
+    src=FINAL / "rec" / "v2_stages" / "04_agentic_design.mp4",
+    # 0.3 wishes + guard fence going up | 6.6 VMC + robot loader placed | 11.6 interlocked gate, aisle in view |
+    # 17.6 Physics + Wishes pills turn green at 18.7 ("All checks pass") | 20.0 settled cell
+    cues=dict(overview=0.3, cnc=6.6, safety=11.6, physics=17.6, risky=20.0, bg=9.0, end=21.8),
+    ui=dict(scene=(0.45, 0.50, 1.30), cnc=(0.54, 0.40, 2.00), safety=(0.58, 0.45, 1.70),
+            physics=(1.00, 0.00, 1.25), risky=(0.50, 0.48, 1.50), end=(0.50, 0.55, 1.45)),
+)
 DESIGN_PRESET = "gemini"
 
 
@@ -1107,10 +1164,117 @@ def build_shots(timeline, follow, follow_n, design_src, cues, preset=None):
     return S, cuts
 
 
+# v2: hover beats in rec/v2_stages/05_understand.mp4  (clip second, duration, cx, cy, zoom) - punched in on the
+# highlighted machine + its Gemini label, exposure lifted ("lift" grade)
+UND_BEATS = [(4.1, 2.2, 0.69, 0.66, 2.2), (6.95, 1.5, 0.72, 0.38, 2.2), (1.55, 1.0, 0.667, 0.78, 2.1)]
+# (tin, weight, cx, cy, zoom)  4.1 "Fadal VMC 5020A vertical machining centre" | 7.1 "Fadal VMC 4020A ..." | 1.6 "Fadal CNC vertical machining center"
+UND_TINT = (13.0, 1.25, 0.53, 0.53)       # "segmented into 49 objects" beat (tin, zoom, cx, cy)
+PHONE_TIN = 3.0                           # follow_video second at "Walk" (band saw -> Fadal VMC 4020A)
+PC_AT_WIPE = 9.5                          # 02_point_cloud second when the wipe starts (cloud assembling)
+PC_UI = (0.56, 0.55, 1.30)                # punch-in on the cloud (cx, cy, zoom)
+
+
+def find_follow_v2(extra=None):
+    names = dict(video="follow_video.mp4", cloud="follow_cloud.mp4", tint="follow_cloud_tint.mp4",
+                 labels="follow_cloud_labeled.mp4")
+    for d in ([Path(extra)] if extra else []) + FOLLOW_DIRS:
+        ps = {k: d / n for k, n in names.items()}
+        if all(p.exists() for p in ps.values()):
+            counts = [nframes(p) for p in ps.values()]
+            if min(counts) > 60 and len(set(counts)) == 1:
+                return ps, counts[0]
+            log(f"follow clips in {d} incomplete/unequal: {counts}")
+    return None, 0
+
+
+def build_shots_v2(timeline, follow, follow_n, design_src, cues):
+    """v2 recut: hype + title identical to v1; product section shows the segmented point cloud (no box models)."""
+    preset = DESIGN_PRESETS["v2"]
+    S = []
+    t = 0.0
+    cuts = []
+    for key, dur, tin, z0, z1, cx, cy, grade in HYPE:
+        cuts.append(t)
+        S.append(dict(t0=t, t1=t + dur, layers=[dict(src=hype_source(key), tin=tin, z0=z0, z1=z1, c0=(cx, cy),
+                                                     c1=(cx, cy), grade=grade)], tag=key))
+        t += dur
+    cuts.append(HYPE_END)
+    t_walk = chunk(timeline, "walk")["start"] - 0.08
+    # title background = v1's clip, so 0:00-0:10 is the same picture as v1
+    S.append(dict(t0=HYPE_END, t1=t_walk, layers=[dict(src=FINAL / "rec" / "stages" / "02_point_cloud.mp4", tin=TITLE_TIN,
+                                                       z0=1.55, z1=1.7, c0=(0.62, 0.52), c1=(0.62, 0.52),
+                                                       grade="dim")], tag="title"))
+    # ---- phone video -> dense cloud (cloud stage) -> segments (tint) -> named machines (hover beats) ----
+    # NOTE: the follow-mode cloud layers do not register to the phone video on the current scan (dense cloud vs
+    # camera track), so the matched-camera wipe is not used; the phone video wipes into the cloud-stage assembly.
+    t_point = word_time(timeline, "cloud", "point", default="start")
+    t_dense = word_time(timeline, "cloud", "dense", default=None) or (t_point - 0.4)
+    sc = chunk(timeline, "scene")
+    t_then = sc["start"] - 0.15
+    t_named = word_time(timeline, "scene", "named", default=sc["start"] + 2.6) - 0.25
+    t_ask = chunk(timeline, "cnc")["start"] - 0.10
+    t_hover = t_named
+    pc = stage_clip("02_point_cloud.mp4")
+    tw0 = t_dense - 0.25
+    S.append(dict(t0=t_walk, t1=t_then,
+                  layers=[dict(src=follow["video"], tin=PHONE_TIN, speed=1.0, z0=1.0, z1=1.04, c0=(0.5, 0.5),
+                               c1=(0.5, 0.5), grade="none"),
+                          dict(src=pc, tin=max(0.0, PC_AT_WIPE - (tw0 - t_walk)), speed=1.0, z0=PC_UI[2],
+                               z1=PC_UI[2] + 0.12, c0=PC_UI[:2], c1=PC_UI[:2], grade="lift")],
+                  wipes=[(tw0, t_dense + 0.65, "wipe")], tag="video_cloud",
+                  label=[("PHONE VIDEO", t_walk), ("DENSE POINT CLOUD \u00b7 2.7 M POINTS \u00b7 LINGBOT-MAP", t_dense)]))
+    und = stage_clip("05_understand.mp4")
+    tin_, z_, cx_, cy_ = UND_TINT
+    S.append(dict(t0=t_then, t1=t_hover, layers=[dict(src=und, tin=tin_, speed=1.0, z0=z_, z1=z_ + 0.10,
+                                                     c0=(cx_, cy_), c1=(cx_, cy_), grade="lift")],
+                  tag="segments", label=[("SEGMENTED BY GEMINI \u00b7 49 OBJECTS", t_then + 0.3)]))
+    # ---- hover beats from the understand stage, punched in ----
+    beats = list(UND_BEATS)
+    n_b = len(beats)
+    wsum = sum(b[1] for b in beats)
+    tt = t_hover
+    for i, (b_tin, wgt, cx, cy, z) in enumerate(beats):
+        t1 = t_ask if i == n_b - 1 else tt + (t_ask - t_hover) * wgt / wsum
+        S.append(dict(t0=tt, t1=t1, layers=[dict(src=und, tin=b_tin, speed=1.0, z0=z, z1=z + 0.08, c0=(cx, cy),
+                                                 c1=(cx, cy), grade="lift")], tag=f"hover{i}",
+                      label=[("NAMED + EXPLAINED BY GEMINI 4 CARBON", tt)] if i == 0 else []))
+        tt = t1
+    # ---- design section (Gemini 4 Carbon session on the segmented model) ----
+    t_place = word_time(timeline, "cnc", "placing", default=None) - 0.25
+    t_guard = word_time(timeline, "cnc", "guarding", default=None) - 0.2
+    t_phys = word_time(timeline, "cnc", "physics") - 0.45
+    t_risky = chunk(timeline, "risky")["start"] - 0.1
+    t_intel = chunk(timeline, "intel")["start"] - 0.1
+    UI = preset["ui"]
+
+    def dlay(cue, ui, dz=0.08, speed=1.0, grade="none"):
+        cx, cy, z = UI[ui]
+        return dict(src=design_src, tin=cues[cue], speed=speed, z0=z, z1=z + dz, c0=(cx, cy), c1=(cx, cy),
+                    grade=grade)
+
+    S.append(dict(t0=t_ask, t1=t_place, layers=[dlay("overview", "scene", 0.06)], tag="agent", agent_tag=True))
+    S.append(dict(t0=t_place, t1=t_guard, layers=[dlay("cnc", "cnc", 0.10, speed=1.6)], tag="cnc", agent_tag=True))
+    S.append(dict(t0=t_guard, t1=t_phys, layers=[dlay("safety", "safety", 0.08)], tag="safety", agent_tag=True))
+    S.append(dict(t0=t_phys, t1=t_risky, layers=[dlay("physics", "physics", 0.06)], tag="physics", agent_tag=True))
+    S.append(dict(t0=t_risky, t1=t_intel, layers=[dlay("risky", "risky", 0.10, speed=0.7)], tag="risky",
+                  agent_tag=True))
+    S.append(dict(t0=t_intel, t1=END_CARD, layers=[dlay("bg", "scene", 0.10, speed=0.6, grade="dimblur")],
+                  tag="ladder"))
+    S.append(dict(t0=END_CARD, t1=DUR, layers=[dlay("end", "end", 0.10, speed=0.3, grade="dimblur")], tag="end"))
+    return S, cuts
+
+
+TITLE_TIN = 10.0
+LIFT_LUT = __import__("numpy").clip(255 * (__import__("numpy").arange(256) / 255) ** 0.80 * 1.10, 0, 255).astype("uint8")
+
+
 def render(timeline, follow, follow_n, design_src, cues, audio_path, out_path):
     import cv2
     import numpy as np
-    shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
+    if CUT == "v2":
+        shots, cuts = build_shots_v2(timeline, follow, follow_n, design_src, cues)
+    else:
+        shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
     for a, b in zip(shots, shots[1:]):
         assert abs(a["t1"] - b["t0"]) < 1e-6, (a["tag"], b["tag"])
     gr = Grader()
@@ -1161,6 +1325,8 @@ def render(timeline, follow, follow_n, design_src, cues, audio_path, out_path):
                     im = gr.col(im, f0 + k)
                 elif g == "dim":
                     im = (im.astype(np.float32) * 0.28).astype(np.uint8)
+                elif g == "lift":      # v2 understand beats: lift the dark top view a little
+                    im = cv2.LUT(im, LIFT_LUT)
                 elif g == "dimblur":
                     im = (cv2.GaussianBlur(im, (0, 0), 9).astype(np.float32) * 0.35).astype(np.uint8)
                 imgs.append(im)
@@ -1289,7 +1455,7 @@ def write_srt(timeline):
             seg = words[wi:wi + nw] or words[-1:]
             items.append((seg[0]["s"], seg[-1]["e"] + 0.15, ln))
             wi += nw
-    with open(FINAL / "captions.srt", "w") as f:
+    with open(FINAL / f"captions{TTS_SUFFIX}.srt", "w") as f:
         for i, (a, b, t) in enumerate(items, 1):
             f.write(f"{i}\n{srt_time(a)} --> {srt_time(min(b, DUR))}\n{t}\n\n")
 
@@ -1299,11 +1465,16 @@ def build(voice, design_src, cues, follow_dir=None):
     import soundfile as sf
     CACHE.mkdir(parents=True, exist_ok=True)
     timeline, vo = build_vo(voice)
-    follow, follow_n = find_follow(follow_dir)
+    if CUT == "v2":
+        follow, follow_n = find_follow_v2(follow_dir)
+        assert follow, "v2 needs rec/v2_follow/follow_{video,cloud,cloud_tint,cloud_labeled}.mp4"
+        shots, cuts = build_shots_v2(timeline, follow, follow_n, design_src, cues)
+    else:
+        follow, follow_n = find_follow(follow_dir)
+        shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
     log("follow clips:", "YES " + str(follow["video"].parent) if follow else "no (stage clips)")
-    shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
     mus = synth_music(cuts, vo, timeline)
-    sf.write(FINAL / "music.wav", mus, SR, subtype="PCM_24")
+    sf.write(FINAL / f"music{TTS_SUFFIX}.wav", mus, SR, subtype="PCM_24")
     vo_st = np.stack([vo, vo], 1)
     mix = vo_st * 1.0 + mus * 10 ** (-9 / 20)
     sf.write(CACHE / "mix_raw.wav", mix.astype(np.float32), SR, subtype="FLOAT")
@@ -1342,6 +1513,10 @@ def whisper_final():
     print(hyp)
     cues = ["walk", "point", "bim", "gemini", "cnc", "checks", "exit", "physics", "risky", "intelligence",
             "carbon", "neon", "argon", "hydrogen", "ifc", "buildable"]
+    if CUT == "v2":
+        cues = ["walk", "dense", "point", "gemini", "segmented", "named", "understood", "ask", "placing",
+                "guarding", "exit", "physics", "risky", "intelligence", "carbon", "neon", "argon", "hydrogen",
+                "buildable"]
     for cw in cues:
         hit = next((w for w in words if re.sub(r"[^a-z0-9]", "", w["w"].lower()).startswith(cw)), None)
         if hit:
@@ -1380,7 +1555,11 @@ def main():
     ap.add_argument("--design-cues", default=None, help="JSON dict overriding the preset cue points")
     ap.add_argument("--follow-dir", default=None)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--cut", default="v1", choices=["v1", "v2"])
     a = ap.parse_args()
+    use_cut(a.cut)
+    if a.cut == "v2" and a.design_preset == "gemini":
+        a.design_preset = "v2"
     DESIGN_PRESET = a.design_preset
     preset = DESIGN_PRESETS[a.design_preset]
     cues = dict(preset["cues"])
