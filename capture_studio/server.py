@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import functools
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -28,7 +29,7 @@ mcp = FastMCP(
         "Capture Studio turns a phone video of a site (factory floor, building under construction) into an editable BIM model.\n"
         "Workflow: 1) reconstruct_scan  2) fit_bim (as-built shell, provenance=scanned)  "
         "3) get_user_messages / list_requirements to learn what the client wants  "
-        "4) design with add_space / add_equipment / add_wall / add_opening / add_fixture / update_element / remove_element  "
+        "4) design with add_space / add_equipment / move_element / add_part / add_wall / add_opening / add_fixture / update_element / remove_element  "
         "5) validate — fix every 'fail', resolve every 'hold' by asking the user (ask_user -> record_approval), "
         "re-validate until ok  6) set_next_steps, commit_revision, export_package.\n"
         "Units are metres, Z up, origin at the shell's min corner. Use say() for one short line "
@@ -350,6 +351,109 @@ def remove_element(state, element_id: str) -> dict:
     if el["provenance"] == "scanned" and el["kind"] == "wall":
         m.setdefault("removed", []).append({"id": el["id"], "name": el["name"]})
     return {"id": element_id, "name": el["name"], "removed": True}
+
+
+@mcp.tool()
+@edit(lambda r, kw: f"{r['name']} moved")
+def move_element(state, element_id: str, pos: list[float], yaw_deg: float | None = None) -> dict:
+    """Relocate a free-standing element (equipment, fixture, column) to pos = [x,y] (its centre on the
+    floor), optionally turning it to yaw_deg. Works on scanned machines too: the as-built object — its
+    scanned points and 3D model — moves with it in the viewer, giving the re-planned floor. Checks
+    (clearance, aisles, egress, clash, anchorage) are re-evaluated; a moved machine must be re-anchored
+    (it comes back with anchored=false)."""
+    m = state["model"]
+    el = _el(state, element_id)
+    if el["kind"] not in ("equipment", "fixture", "column"):
+        raise ValueError("only equipment, fixtures and columns can be moved; walls are edited with update_element")
+    if "origin" not in el:
+        el["origin"] = {"pos": list(el["pos"]), "yaw_deg": el.get("yaw_deg", 0.0)}   # where the scan found it
+    el["pos"] = [float(pos[0]), float(pos[1])]
+    if yaw_deg is not None:
+        el["yaw_deg"] = float(yaw_deg)
+    if el["provenance"] == "scanned":
+        el["relocated"] = True
+        el["anchored"] = False
+    return bim.brief(m, el)
+
+
+@mcp.tool()
+@edit(lambda r, kw: f"{kw.get('name', 'Part')} added to {r['name']}")
+def add_part(state, element_id: str, name: str, pos: list[float], size: list[float], shape: str = "box",
+             color: str = "#ff8a3d", note: str = "") -> dict:
+    """Edit an object's own 3D model by attaching a part to it (guard enclosure, bar feeder, chip
+    conveyor, light curtain, robot pedestal, extraction hood, control cabinet…). pos = [x,y,z] of the
+    part's CENTRE in the element's local frame (origin at the element's centre on the floor, x along
+    its length, y across, z up, metres); size = [x,y,z] extents; shape: box | cylinder (axis along z).
+    The part moves with the element and counts toward its footprint for clearance and clash checks.
+    note = one line on why it is there."""
+    m = state["model"]
+    el = _el(state, element_id)
+    if el["kind"] not in ("equipment", "fixture"):
+        raise ValueError("parts can be attached to equipment and fixtures")
+    if shape not in ("box", "cylinder"):
+        raise ValueError("shape must be box or cylinder")
+    if len(pos) != 3 or len(size) != 3 or min(size) <= 0:
+        raise ValueError("pos and size need three numbers; sizes must be positive")
+    parts = el.setdefault("parts", [])
+    part = {"id": f"part_{len(parts) + 1}_{abs(hash((name, tuple(pos)))) % 9999:04d}", "name": name, "pos": [float(v) for v in pos],
+            "size": [float(v) for v in size], "shape": shape, "color": color, "note": note}
+    parts.append(part)
+    return bim.brief(m, el) | {"parts": parts}
+
+
+@mcp.tool()
+@edit(lambda r, kw: f"Part removed from {r['name']}")
+def remove_part(state, element_id: str, part_id: str) -> dict:
+    """Remove a part previously attached with add_part."""
+    m = state["model"]
+    el = _el(state, element_id)
+    before = len(el.get("parts", []))
+    el["parts"] = [q for q in el.get("parts", []) if q["id"] != part_id]
+    if len(el["parts"]) == before:
+        raise ValueError(f"no part {part_id!r} on that element")
+    return bim.brief(m, el) | {"parts": el["parts"]}
+
+
+@mcp.tool()
+def save_scenario(name: str, title: str = "") -> dict:
+    """Save the whole project (model, history, requirements, questions, next steps) as a named
+    scenario that can be reloaded instantly for a demo."""
+    s = store.load()
+    safe = "".join(c for c in name.lower().replace(" ", "_") if c.isalnum() or c in "_-")[:40]
+    if not safe:
+        return {"error": "name needs letters or digits"}
+    d = store.DATA / "scenarios"
+    d.mkdir(parents=True, exist_ok=True)
+    s["scenario"] = {"name": safe, "title": title or name}
+    (d / f"{safe}.json").write_text(json.dumps(s))
+    return {"saved": safe, "title": s["scenario"]["title"], "events": len(s["history"])}
+
+
+@mcp.tool()
+def list_scenarios() -> dict:
+    """Saved scenarios available to load."""
+    d = store.DATA / "scenarios"
+    out = []
+    for f in sorted(d.glob("*.json")) if d.exists() else []:
+        sc = json.loads(f.read_text())
+        out.append({"name": f.stem, "title": sc.get("scenario", {}).get("title", f.stem), "events": len(sc.get("history", [])),
+                    "revision": f"R{sc['model']['revision']}"})
+    return {"scenarios": out}
+
+
+@mcp.tool()
+def load_scenario(name: str) -> dict:
+    """Replace the current project with a saved scenario (the current state is kept as
+    scenario 'autosave_before_load'). The viewer replays its history."""
+    f = store.DATA / "scenarios" / f"{name}.json"
+    if not f.exists():
+        return {"error": f"no scenario {name!r}", "available": [x["name"] for x in list_scenarios()["scenarios"]]}
+    cur = store.load()
+    (store.DATA / "scenarios" / "autosave_before_load.json").write_text(json.dumps(cur))
+    s = json.loads(f.read_text())
+    s["seq"] = max(s.get("seq", 0), cur.get("seq", 0)) + 1      # viewers poll on seq: always move forward
+    store.save(s)
+    return {"loaded": name, "events": len(s["history"]), "revision": f"R{s['model']['revision']}"}
 
 
 @mcp.tool()

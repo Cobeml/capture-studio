@@ -39,6 +39,11 @@ MATERIALS = {
 OPENING_KINDS = ("door", "window", "void")
 
 
+def is_new(e: dict) -> bool:
+    """Work to be done: designed elements, and scanned ones that the design relocates."""
+    return e["provenance"] == "proposed" or bool(e.get("relocated"))
+
+
 def new_id(kind: str, model: dict) -> str:
     seed = f"{kind}{time.time_ns()}{len(model['elements'])}".encode()
     return f"{kind}_{hashlib.sha1(seed).hexdigest()[:8]}"
@@ -171,7 +176,11 @@ def solids(model: dict, el: dict) -> list[dict]:
         return [{"c": [sx / 2, sy / 2, el["thickness"] / 2], "s": [sx, sy, el["thickness"]]}]
     if k in ("fixture", "equipment"):
         l, d, h = el["size"]
-        return [{"c": [0, 0, h / 2], "s": [l, d, h]}]
+        out = [{"c": [0, 0, h / 2], "s": [l, d, h]}]
+        for part in el.get("parts", []):      # add-ons in the element's local frame (x along length, z up)
+            out.append({"c": list(part["pos"]), "s": list(part["size"]), "part": part["id"], "name": part["name"],
+                        "shape": part.get("shape", "box"), "color": part.get("color", "#ff8a3d")})
+        return out
     return []
 
 

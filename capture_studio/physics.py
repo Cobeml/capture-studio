@@ -39,7 +39,7 @@ def find_ties(model: dict) -> dict[str, list[str]]:
     walls = [e for e in els.values() if e["kind"] == "wall"]
     ties: dict[str, list[str]] = {}
     for e in els.values():
-        if e["provenance"] != "proposed" or e["kind"] not in DYNAMIC_KINDS:
+        if not bim.is_new(e) or e["kind"] not in DYNAMIC_KINDS:
             continue
         t: list[str] = []
         if e.get("anchored") or e.get("head_restraint"):
@@ -78,7 +78,7 @@ def build_mjcf(model: dict, with_ties=True, drop_boxes: list | None = None, isol
         if not boxes:
             continue
         p = bim.pose(model, e)
-        is_dyn = e["provenance"] == "proposed" and e["kind"] in DYNAMIC_KINDS
+        is_dyn = bim.is_new(e) and e["kind"] in DYNAMIC_KINDS
         dens = bim.density(model, e)
         mask = ('contype="2" conaffinity="1" ' if is_dyn else 'contype="1" conaffinity="2" ') if isolate else ""
         geoms = "".join(
@@ -122,9 +122,8 @@ def _clashes(m, d, model) -> list[dict]:
             continue
         a = m.body(m.geom_bodyid[c.geom1]).name
         b = m.body(m.geom_bodyid[c.geom2]).name
-        pa = model["elements"].get(a, {}).get("provenance")
-        pb = model["elements"].get(b, {}).get("provenance")
-        if "proposed" not in (pa, pb) or (a, b) in seen:
+        ea, eb = model["elements"].get(a), model["elements"].get(b)
+        if not ((ea and bim.is_new(ea)) or (eb and bim.is_new(eb))) or (a, b) in seen:
             continue
         seen.add((a, b))
         out.append({"a": a, "b": b, "depth_mm": round(-c.dist * 1000)})
@@ -190,7 +189,7 @@ def run(model: dict, lateral_g: float | None = None, erection_g=0.05) -> dict:
     for c in report["clashes"]:
         report["issues"].append({
             "key": f"clash:{c['a']}:{c['b']}", "category": "physics", "severity": "fail", "rule": "Clash",
-            "ref": "MuJoCo contact", "element": c["a"] if els[c["a"]]["provenance"] == "proposed" else c["b"],
+            "ref": "MuJoCo contact", "element": c["a"] if bim.is_new(els[c["a"]]) else c["b"],
             "message": f"{els[c['a']]['name']} overlaps {els[c['b']]['name']} by {c['depth_mm']} mm.",
             "fix": "Move or resize one of them."})
     if clashing:

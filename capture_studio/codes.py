@@ -159,7 +159,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
         solid = [e for e in els.values() if e["kind"] in ("equipment", "fixture", "column")]
         aisles = [e for e in spaces if e["use"] in ("aisle", "forklift_aisle", "exit_access")]
         for e in solid:
-            if e["provenance"] == "proposed" and e["kind"] == "equipment":
+            if bim.is_new(e) and e["kind"] == "equipment":
                 if e.get("hazard") and not e.get("guarded"):
                     issue(f"guarding:{e['id']}", "safety", "fail", "Machine guarding", "machine", e["id"],
                           f"{e['name']} has exposed hazards (point of operation / moving parts) and no guarding.",
@@ -169,7 +169,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
                           f"{e['name']} is a fixed machine and is not anchored to the slab.",
                           "Set anchored=true (anchor bolts per maker's foundation drawing).")
                 for o in solid:
-                    if o["id"] == e["id"] or (o["provenance"] == "proposed" and o["id"] < e["id"]):
+                    if o["id"] == e["id"] or (bim.is_new(o) and o["id"] < e["id"]):
                         continue
                     gap = bim.plan_gap(model, e, o)
                     need = prof["machine_clearance"]
@@ -181,7 +181,7 @@ def check(model: dict, approvals: dict | None = None) -> dict:
                 fp = bim.footprint(model, e)
                 pts = fp + [bim.poly_centroid(fp)] if fp else []
                 if any(bim.point_in_poly(q, a["polygon"]) for q in pts):
-                    sev = "fail" if e["provenance"] == "proposed" else "warn"
+                    sev = "fail" if bim.is_new(e) else "warn"
                     issue(f"aisle:{e['id']}:{a['id']}", "safety", sev, "Aisle obstructed", "aisle", e["id"],
                           f"{e['name']} stands in {a['name']}; aisles must be kept clear.",
                           "Move it out of the aisle or reroute the aisle around it.")

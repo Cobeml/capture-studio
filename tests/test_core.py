@@ -121,3 +121,23 @@ def test_factory_unanchored_rack_topples_at_industrial_lateral_load():
     assert r["lateral_g"] == 0.25 and not r["bodies"][rack["id"]]["stable"]
     rack["anchored"] = True
     assert physics.run(m)["ok"]
+
+
+def test_parts_extend_the_footprint_and_follow_the_element():
+    m = factory()
+    cnc = bim.add(m, "equipment", name="CNC mill", pos=[2.5, 1.0], size=[2.4, 1.6, 2.2], category="machine",
+                  material="machine", guarded=True, anchored=True, fixed=True)
+    cnc["parts"] = [{"id": "p1", "name": "Bar feeder", "pos": [2.2, 0, 0.6], "size": [2.0, 0.5, 1.2], "shape": "box"}]
+    xs = [p[0] for p in bim.footprint(m, cnc)]
+    assert max(xs) > 2.5 + 1.2 + 1.9          # feeder sticks out past the machine body
+    snap = bim.snapshot(m)["elements"][cnc["id"]]
+    assert len(snap["boxes"]) == 2 and snap["boxes"][1]["name"] == "Bar feeder"
+
+
+def test_relocated_scanned_machine_is_checked_like_new_work():
+    m = factory()
+    lathe = next(e for e in m["elements"].values() if e["name"] == "Existing lathe")
+    lathe.update(pos=[2.5, 3.0], relocated=True, anchored=False)        # moved into the aisle, not re-anchored
+    k = keys(codes.check(m))
+    assert {"anchor", "aisle"} <= k, k
+    assert lathe["id"] in physics.run(m)["bodies"]                       # and it is simulated, not static
