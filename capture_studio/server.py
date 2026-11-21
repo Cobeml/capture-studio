@@ -49,6 +49,12 @@ def _validate(state: dict, run_physics=True) -> dict:
                                      [i for i in prev.get("issues", []) if i["category"] == "physics" or i["key"].startswith("propping:")])
     for r in state["requirements"]:
         _eval_requirement(model, r)
+    for r in state["requirements"]:
+        if r["status"] != "met":
+            issues.append({"key": f"requirement:{r['id']}", "category": "desire", "severity": "fail", "rule": "Client requirement not met",
+                           "ref": "client brief", "element": None, "message": f"Not yet satisfied: {r['text']}",
+                           "fix": "Build what was asked" + (f" (auto-check: {json.dumps(r['check'])})" if r.get("check") else
+                                                            ", then resolve_requirement with evidence") + "."})
     cat = lambda c, sev: [i for i in issues if i["category"] == c and i["severity"] in sev]  # noqa: E731
     v = {
         "code_ok": not cat("code", ("fail",)),
@@ -162,18 +168,23 @@ def reconstruct_scan(fps: int = 6, force: bool = False) -> dict:
 
 
 @mcp.tool()
-def fit_bim(reset_design: bool = False, site_type: str = "factory") -> dict:
+def fit_bim(reset_design: bool = False, site_type: str = "factory", keep_conversation: bool = False) -> dict:
     """Stage 2→3. Fit the as-built model to the point cloud and create revision R1: floor slab,
     walls with doors/windows, and existing equipment (machines, racks, benches as scan-coloured
     boxes). Every fitted element is provenance='scanned' and carries its fit residual to the scan
     (P50/P95 mm). site_type: 'factory' (OSHA_1910 profile) or 'residential' (NBC_INDIA_2016).
-    Refuses to overwrite an existing design unless reset_design=true."""
+    Refuses to overwrite an existing design unless reset_design=true. A reset also clears the
+    requirements, questions and approvals (unread client messages are kept); keep_conversation=true keeps them."""
     from . import fit
     s = store.load()
     if any(e["provenance"] == "proposed" for e in s["model"]["elements"].values()) and not reset_design:
         return {"error": "a design already exists; pass reset_design=true to discard it and refit"}
-    keep = {k: s[k] for k in ("messages", "requirements")}
+    had_design = bool(s["history"])
+    keep = {k: s[k] for k in ("messages", "requirements")} if (keep_conversation or not had_design) else \
+           {"messages": [m for m in s["messages"] if not m["read"]]}
+    seq = s["seq"]
     s = store.fresh() | keep
+    s["seq"] = seq + 1
     s["model"], report = fit.fit_shell()
     s["model"]["project"]["code_profile"] = "OSHA_1910" if site_type == "factory" else "NBC_INDIA_2016"
     s["model"]["project"]["site_type"] = site_type
@@ -226,7 +237,8 @@ def get_quantities() -> dict:
 def add_wall(state, start: list[float], end: list[float], thickness: float = 0.1, height: float | None = None,
              material: str = "aac_block", name: str | None = None, head_restraint: bool = False) -> dict:
     """Add a partition wall along a centreline from start [x,y] to end [x,y].
-    height defaults to the ceiling height. material: aac_block | masonry | drywall | concrete | timber.
+    height defaults to the ceiling height. material: aac_block | masonry | drywall | concrete | timber | steel |
+    mesh_fence (welded-mesh machine guarding: use it, about 2.2 m high and 0.05 m thick, for guard fences).
     A wall whose end touches another wall is tied into it; head_restraint=true fixes its top to the soffit.
     Free-standing walls will fail the physics check."""
     m = state["model"]
@@ -586,7 +598,9 @@ def ask_user(question: str, options: list[str]) -> dict:
 
 @mcp.tool()
 def get_user_answer(question_id: str, wait_seconds: int = 0) -> dict:
-    """The human's answer to ask_user (answer is null until they click). Optionally wait up to 120 s."""
+    """The human's answer to ask_user (answer is null until they click). Optionally wait up to 120 s.
+    If there is still no answer, do not work around the question: say you are waiting and end your
+    turn — the answer is delivered when the human clicks."""
     deadline = time.time() + min(wait_seconds, 120)
     while True:
         s = store.load()
@@ -648,6 +662,10 @@ def commit_revision(note: str) -> dict:
     if not (v["code_ok"] and v["safety_ok"] and v["physics_ok"]):
         store.save(s)
         return {"error": "not committed: open fail/hold issues", "validation": _brief_validation(v)}
+    last = next((h for h in reversed(s["history"]) if h["action"] in ("commit_revision", "fit_bim")), None)
+    if last and last["model"]["elements"] == s["model"]["elements"]:
+        store.save(s)
+        return {"error": f"nothing changed since R{s['model']['revision']}; no new revision created"}
     s["model"]["revision"] += 1
     s["model"]["revision_note"] = note
     s["stage"] = "design"

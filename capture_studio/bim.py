@@ -32,6 +32,7 @@ MATERIALS = {
     "steel": {"density": 7850, "cost_m3": 9500, "color": "#5f6b7a"},
     "glass": {"density": 2500, "cost_m3": 3000, "color": "#9fd3e6"},
     "casework": {"density": 350, "cost_m3": 900, "color": "#c9b79c"},
+    "mesh_fence": {"density": 300, "cost_m3": 1400, "color": "#e3b341"},  # welded-mesh guarding panels, volume-averaged
     "machine": {"density": 1200, "cost_m3": 0, "color": "#7d8894"},      # enclosure-average density of a machine tool
     "racking": {"density": 220, "cost_m3": 260, "color": "#3f6fb5"},     # loaded pallet/shelf racking, volume-averaged
 }
