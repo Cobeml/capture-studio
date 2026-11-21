@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from . import bim, codes, physics, store
+from . import bim, codes, decisions, physics, store
 
 mcp = FastMCP(
     "capture-studio", host="127.0.0.1", port=int(os.environ.get("CAPTURE_STUDIO_PORT", 8642)), stateless_http=True, json_response=True,
@@ -40,7 +40,7 @@ mcp = FastMCP(
 
 # ---------------------------------------------------------------- helpers
 
-def _validate(state: dict, run_physics=True) -> dict:
+def _validate(state: dict, run_physics=True, run_review=False) -> dict:
     model = state["model"]
     code = codes.check(model, state["approvals"])
     prev = state.get("validation") or {}
@@ -55,6 +55,12 @@ def _validate(state: dict, run_physics=True) -> dict:
                            "ref": "client brief", "element": None, "message": f"Not yet satisfied: {r['text']}",
                            "fix": "Build what was asked" + (f" (auto-check: {json.dumps(r['check'])})" if r.get("check") else
                                                             ", then resolve_requirement with evidence") + "."})
+    review = prev.get("review")
+    if run_review:      # independent closed-question review (Gemini Decisions API); optional, never blocks if unavailable
+        review = decisions.review(state, {"issues": issues})
+    if review and review.get("available"):
+        issues += [i for i in review.get("issues", []) if not (i["severity"] == "fail" and not run_review)] if run_review \
+            else [i for i in prev.get("issues", []) if i["category"] == "review"]
     cat = lambda c, sev: [i for i in issues if i["category"] == c and i["severity"] in sev]  # noqa: E731
     v = {
         "code_ok": not cat("code", ("fail",)),
@@ -64,8 +70,9 @@ def _validate(state: dict, run_physics=True) -> dict:
         "desires_ok": bool(state["requirements"]) and all(r["status"] == "met" for r in state["requirements"]),
         "counts": {s: sum(i["severity"] == s for i in issues) for s in ("fail", "warn", "hold")},
         "profile": code["profile"], "issues": issues, "egress": code["egress"], "physics": phys,
+        "review": review, "review_ok": (not cat("review", ("fail",))) if (review and review.get("available")) else None,
     }
-    v["ok"] = bool(v["code_ok"] and v["safety_ok"] and v["physics_ok"] and
+    v["ok"] = bool(v["code_ok"] and v["safety_ok"] and v["physics_ok"] and v["review_ok"] is not False and
                    (v["desires_ok"] or not state["requirements"]))
     state["validation"] = v
     return v
@@ -90,6 +97,7 @@ def _eval_requirement(model: dict, r: dict):
 
 def _brief_validation(v: dict) -> dict:
     return {"ok": v["ok"], "code_ok": v["code_ok"], "safety_ok": v["safety_ok"], "physics_ok": v["physics_ok"],
+            "review_ok": v.get("review_ok"),
             "physics_stale": v["physics_stale"], "desires_ok": v["desires_ok"], "counts": v["counts"],
             "issues": [{k: i[k] for k in ("key", "category", "severity", "rule", "element", "message", "fix")}
                        for i in v["issues"]]}
@@ -488,10 +496,12 @@ def undo() -> dict:
 def validate() -> dict:
     """Run everything: building-code rules, site-safety rules, MuJoCo physical robustness
     (clash, lateral tilt test, erection-stage stability) and the client's requirements.
+    Then an independent reviewer (Gemini Decisions API, when configured) answers closed questions the
+    rules cannot: is each client requirement really delivered, is flagged guarding actually modelled.
     Returns every open issue with a concrete fix. 'fail' = change the design; 'hold' = needs
     the user's sign-off; 'warn' = site action to carry into next steps."""
     s = store.load()
-    v = _validate(s, run_physics=True)
+    v = _validate(s, run_physics=True, run_review=True)
     ph = v["physics"]
     store.record(s, "agent", "validate",
                  "All checks pass" if v["ok"] else f"{v['counts']['fail']} to fix · {v['counts']['hold']} to sign off",
@@ -502,6 +512,7 @@ def validate() -> dict:
     out["physics"] = {"bodies": ph["bodies"], "ties": ph["ties"], "clashes": ph["clashes"], "note": ph.get("note")}
     out["egress_m"] = {k: (p and p["length"]) for k, p in v["egress"]["paths"].items()}
     out["requirements"] = s["requirements"]
+    out["review"] = v.get("review")
     return out
 
 

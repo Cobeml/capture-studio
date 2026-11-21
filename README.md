@@ -92,6 +92,11 @@ sign-off) or **warn** (site action, carried into next steps).
   fixes to the slab. Tests: initial clashes; a service tilt test (gravity gains 0.25 g horizontally —
   0.15 g residential — in 4 directions; > 20 mm slide or > 2° tilt fails); an erection test with all ties removed at 0.05 g
   (what needs temporary propping); and, on export, a drop test (boxes dropped on the slab must come to rest).
+- **Independent review** (`capture_studio/decisions.py`, optional) — after the rules and physics, the Gemini
+  Decisions API (`gemini-decision-1`) answers closed yes/no and rubric questions over the brief, the design JSON,
+  the rule results and a plan drawing: is each client requirement really delivered, is guarding that is flagged
+  actually modelled. It returns calibrated probabilities, not text: a confident "no" is a **fail**, an unsure
+  answer a **warn** for a person to check. Skipped silently when no API key is configured.
 - **Requirements** — client wishes recorded with `add_requirement`, auto-checked (space use + area,
   or a named proposed element) or closed manually with evidence.
 

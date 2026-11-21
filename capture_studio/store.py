@@ -52,7 +52,7 @@ def record(state: dict, actor: str, action: str, caption: str, focus: list[str] 
 def summarize_validation(v: dict | None) -> dict | None:
     if not v:
         return None
-    out = {k: v.get(k) for k in ("code_ok", "safety_ok", "physics_ok", "desires_ok", "counts", "egress")}
+    out = {k: v.get(k) for k in ("code_ok", "safety_ok", "physics_ok", "desires_ok", "review_ok", "counts", "egress")}
     out["issues"] = [{k: i.get(k) for k in ("severity", "category", "rule", "element", "message")} for i in v.get("issues", [])]
     return out
 
