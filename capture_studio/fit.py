@@ -65,6 +65,8 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     C = -np.einsum("sji,sj->si", R, t)             # camera centres
     fwd = R[:, 2, :]
     up_cam = -R[:, 1, :]
+    upv = up_cam.copy()
+    o3d.utility.random.seed(0)                     # deterministic RANSAC: refits land in the same frame
 
     # --- filter: confidence + depth discontinuities (flying pixels), stride 2
     depth = np.einsum("sij,shwj->shwi", R, pts)[..., 2] + t[:, None, None, 2]
@@ -96,7 +98,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
             break
         pc = pc.select_by_index(inl, invert=True)
     Rg = _rot_to_z(n_floor)
-    P, C, fwd = P @ Rg.T, C @ Rg.T, fwd @ Rg.T
+    P, C, fwd, upv = P @ Rg.T, C @ Rg.T, fwd @ Rg.T, upv @ Rg.T
     z0 = -d_floor if d_floor is not None else float(np.percentile(P[:, 2], 2))
     P[:, 2] -= z0
     C[:, 2] -= z0
@@ -150,7 +152,7 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     yaw = float(edges[int(np.argmax(hist))] + (edges[1] - edges[0]) / 2)
     c_, s_ = math.cos(-yaw), math.sin(-yaw)
     Rz = np.array([[c_, -s_, 0], [s_, c_, 0], [0, 0, 1]])
-    P, C, fwd = P @ Rz.T, C @ Rz.T, fwd @ Rz.T
+    P, C, fwd, upv = P @ Rz.T, C @ Rz.T, fwd @ Rz.T, upv @ Rz.T
 
     # --- origin at the min corner of the walls; crop far outliers (things seen through windows)
     wb = P[band]
@@ -184,7 +186,10 @@ def prepare_cloud(max_points=1_600_000) -> dict:
     offsets = np.searchsorted(f_idx, np.arange(S + 1)).tolist()
     meta = {
         "n": int(len(P)), "frames": int(S), "fps": float(z["fps"]), "frame_offsets": offsets,
-        "cameras": [[round(float(v), 3) for v in (*C[i], *fwd[i])] for i in range(S)],
+        # per frame: position, forward, up (model frame) — enough to re-fly the capture path exactly
+        "cameras": [[round(float(v), 4) for v in (*C[i], *fwd[i], *upv[i])] for i in range(S)],
+        "fov_y_deg": round(float(np.degrees(2 * np.arctan(H / 2 / np.median(z["intrinsic"][:, 1, 1])))), 2),
+        "aspect": round(W / H, 4),
         "center": [round(float(ext[0] / 2), 2), round(float(ext[1] / 2), 2), 1.0],
         "radius": round(float(np.linalg.norm(ext) / 2), 2), "extent_m": [round(float(v), 2) for v in ext],
         "ceiling_height": round(ceil, 3), "ceiling_source": ceil_source, "view_clip": round(min(ceil - 0.2, 3.4), 2), "scale": round(scale, 5), "scale_source": source, "voxel_m": round(vox, 4),
