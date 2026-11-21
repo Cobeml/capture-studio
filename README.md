@@ -1,6 +1,6 @@
 # Capture Studio
 
-Capture Studio turns a phone video of a factory into manufacturing-grade AI analysis and process engineering.
+When on-shoring production, the US is not lacking the technological capacity but the process knowledge for complicated production processes. Capture Studio turns a phone video of a factory into manufacturing-grade AI analysis and process engineering.
 
 It uses LingBot to generate a point cloud from the video and then our agent semantically and spatially segments the points into objects for a process. The segmented objects are an editable BIM model that an AI agent can redesign or replicate through an MCP. Every design edit is checked against a building-code profile, site-safety rules and a MuJoCo rigid-body stability test; decisions that need a human are put to the user in a minimal three.js viewer, and the result is exported as IFC4 + GLB + MJCF. The semantic segmentation of the point cloud, 3d reconstruction, BIM editing and CAD are all powered by Gemini 4.
 
