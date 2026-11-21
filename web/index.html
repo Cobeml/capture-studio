@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capture Studio</title>
+<style>
+  :root { --bg:#0b0d10; --ink:#eef1f4; --dim:#8a93a0; --line:#232830; --accent:#ff8a3d; --ok:#3ddc97; --bad:#ff5a5f; --hold:#ffc857; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); overflow:hidden;
+    font:14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas#gl { position:fixed; inset:0; display:block; }
+  #brand { position:fixed; top:18px; left:22px; font-weight:650; letter-spacing:.02em; font-size:15px; }
+  #brand span { color:var(--dim); font-weight:500; margin-left:8px; }
+  #caption { position:fixed; top:16px; left:50%; transform:translateX(-50%); font-size:17px; font-weight:560;
+    padding:8px 16px; border-radius:999px; background:#12161bcc; backdrop-filter:blur(8px); border:1px solid var(--line);
+    transition:opacity .3s; white-space:nowrap; max-width:60vw; overflow:hidden; text-overflow:ellipsis; }
+  #caption:empty { opacity:0; }
+  #pills { position:fixed; top:16px; right:22px; display:flex; gap:8px; transition:opacity .4s; }
+  .pill { padding:6px 12px; border-radius:999px; border:1px solid var(--line); background:#12161bcc; color:var(--dim);
+    font-size:12.5px; font-weight:600; display:flex; align-items:center; gap:7px; }
+  .pill i { width:8px; height:8px; border-radius:50%; background:#444b55; transition:background .3s, box-shadow .3s; }
+  .pill.ok { color:var(--ink); } .pill.ok i { background:var(--ok); box-shadow:0 0 10px var(--ok); }
+  .pill.bad { color:var(--ink); } .pill.bad i { background:var(--bad); box-shadow:0 0 10px var(--bad); }
+  .pill.hold { color:var(--ink); } .pill.hold i { background:var(--hold); box-shadow:0 0 10px var(--hold); }
+
+  #video { position:fixed; left:50%; top:47%; width:min(74vw, 1180px); transform:translate(-50%,-50%); border-radius:14px;
+    box-shadow:0 30px 90px #000a; transition:all .9s cubic-bezier(.6,.05,.2,1); z-index:3; background:#000; }
+  body:not([data-stage="scan"]) #video { left:22px; top:auto; bottom:96px; width:250px; transform:none; border-radius:10px; opacity:.95; }
+  body[data-stage="bim"] #video, body[data-stage="design"] #video { opacity:0; pointer-events:none; }
+
+  #steps { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px;
+    padding:6px; border-radius:999px; background:#12161bdd; border:1px solid var(--line); backdrop-filter:blur(8px); z-index:5; }
+  #steps button { all:unset; cursor:pointer; padding:9px 18px; border-radius:999px; color:var(--dim); font-weight:600; font-size:13.5px; transition:.25s; }
+  #steps button.on { background:var(--ink); color:#0b0d10; }
+  #steps button#play { padding:9px 13px; color:var(--ink); }
+  #steps .sep { width:14px; height:1px; background:var(--line); }
+
+  #say { position:fixed; right:22px; bottom:22px; width:330px; z-index:5; transition:opacity .4s, transform .4s; }
+  body:not([data-stage="design"]) #say, body:not([data-stage="design"]) #pills, body:not([data-stage="design"]) #side { opacity:0; pointer-events:none; }
+  #say form { display:flex; gap:6px; padding:6px; border-radius:14px; background:#12161bdd; border:1px solid var(--line); }
+  #say input { flex:1; background:none; border:0; outline:0; color:var(--ink); font:inherit; padding:6px 8px; }
+  #say button { all:unset; cursor:pointer; padding:6px 12px; border-radius:9px; background:var(--accent); color:#111; font-weight:700; }
+  #q { margin-bottom:8px; padding:12px; border-radius:14px; background:#1a1508ee; border:1px solid var(--hold); display:none; }
+  #q p { margin:0 0 10px; font-weight:560; } #q div { display:flex; gap:6px; flex-wrap:wrap; }
+  #q button { all:unset; cursor:pointer; padding:6px 12px; border-radius:9px; border:1px solid var(--hold); font-weight:600; font-size:13px; }
+  #q button:first-child { background:var(--hold); color:#111; }
+  #sent { color:var(--dim); font-size:12px; padding:4px 8px; height:20px; }
+
+  #side { position:fixed; right:22px; top:64px; width:330px; max-height:calc(100vh - 240px); overflow:auto; transition:opacity .4s; }
+  .card { padding:12px 14px; border-radius:14px; background:#12161bdd; border:1px solid var(--line); margin-bottom:8px; }
+  .card h4 { margin:0 0 8px; font-size:11.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--dim); font-weight:650; }
+  .row { display:flex; gap:9px; padding:4px 0; font-size:13px; align-items:baseline; }
+  .row b { flex:none; width:8px; height:8px; border-radius:50%; background:#444b55; transform:translateY(-1px); }
+  .row.fail b { background:var(--bad); } .row.hold b { background:var(--hold); } .row.warn b { background:#5b6572; } .row.met b { background:var(--ok); }
+  .row small { color:var(--dim); margin-left:auto; flex:none; }
+  ol.steps { margin:0; padding-left:20px; } ol.steps li { padding:3px 0; font-size:13px; } ol.steps small { color:var(--dim); }
+  #stat { position:fixed; left:22px; bottom:26px; color:var(--dim); font-size:12.5px; font-variant-numeric:tabular-nums; }
+  .label { position:fixed; pointer-events:none; transform:translate(-50%,-50%); font-size:12px; font-weight:650; text-align:center;
+    text-shadow:0 1px 6px #000; white-space:nowrap; } .label small { display:block; color:#cfd6de; font-weight:500; }
+</style>
+</head>
+<body data-stage="scan">
+<canvas id="gl"></canvas>
+<div id="brand">Capture Studio<span id="rev"></span></div>
+<div id="caption"></div>
+<div id="pills">
+  <div class="pill" id="p-code"><i></i>Code</div><div class="pill" id="p-safety"><i></i>Safety</div>
+  <div class="pill" id="p-physics"><i></i>Physics</div><div class="pill" id="p-wishes"><i></i>Wishes</div>
+</div>
+<video id="video" src="/data/site.mp4" muted playsinline loop></video>
+<div id="side"></div>
+<div id="labels"></div>
+<div id="stat"></div>
+<div id="say">
+  <div id="q"><p></p><div></div></div>
+  <form><input placeholder="Tell the agent what you want…" autocomplete="off"><button>Send</button></form>
+  <div id="sent"></div>
+</div>
+<div id="steps">
+  <button id="play" title="Play the whole story">▶</button>
+  <button data-s="scan">Video</button><span class="sep"></span><button data-s="cloud">Point cloud</button><span class="sep"></span>
+  <button data-s="bim">BIM</button><span class="sep"></span><button data-s="design">Agentic design</button>
+</div>
+
+<script type="importmap">{ "imports": { "three": "/web/vendor/three.module.js" } }</script>
+<script type="module" src="/web/app.js"></script>
+</body>
+</html>

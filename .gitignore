@@ -1,0 +1,8 @@
+.venv/
+models/
+third_party/
+data/site_raw.mp4
+data/site_frames/
+data/scan/raw_predictions.npz
+__pycache__/
+*.pyc
