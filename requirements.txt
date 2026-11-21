@@ -1,0 +1,11 @@
+# torch==2.9.1 / torchvision==0.24.1 (CUDA 12.8) and third_party/lingbot-map (pip install -e) are installed separately
+mujoco
+mcp[cli]<2
+open3d
+numpy
+scipy
+opencv-python-headless
+trimesh
+ifcopenshell
+huggingface_hub
+pytest

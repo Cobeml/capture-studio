@@ -1,6 +1,6 @@
 """Capture Studio MCP server + demo viewer (one process).
 
-    python -m capture_studio.server            # http://127.0.0.1:8765  (viewer)  +  /mcp  (MCP, streamable HTTP)
+    python -m capture_studio.server            # http://127.0.0.1:8642  (viewer)  +  /mcp  (MCP, streamable HTTP)
     python -m capture_studio.server --stdio    # MCP over stdio (state is shared through data/project/state.json)
 
 Any MCP client (Claude, Gemini CLI / google-genai, …) drives the same workflow:
@@ -22,7 +22,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from . import bim, codes, physics, store
 
 mcp = FastMCP(
-    "capture-studio", host="127.0.0.1", port=8765, stateless_http=True, json_response=True,
+    "capture-studio", host="127.0.0.1", port=8642, stateless_http=True, json_response=True,
     instructions=(
         "Capture Studio turns a phone video of a construction site into an editable BIM model.\n"
         "Workflow: 1) reconstruct_scan  2) fit_bim (as-built shell, provenance=scanned)  "
