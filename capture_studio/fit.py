@@ -226,6 +226,24 @@ def _faces(P, N, H, cell=0.05):
     return faces
 
 
+def _seen_through(face, faces, P, Cp, H, n=3000) -> float:
+    """Fraction of a face's points whose camera ray first passes through another wall face."""
+    idx = np.flatnonzero(face["mem"])
+    idx = idx[:: max(1, len(idx) // n)]
+    p, c = P[idx], Cp[idx]
+    through = np.zeros(len(idx), bool)
+    for g in faces:
+        if g is face:
+            continue
+        a, b = g["axis"], 1 - g["axis"]
+        den = p[:, a] - c[:, a]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = (g["c"] - c[:, a]) / den
+        x = c + t[:, None] * (p - c)
+        through |= (t > 0.03) & (t < 0.97) & (x[:, b] > g["b0"]) & (x[:, b] < g["b1"]) & (x[:, 2] > 0) & (x[:, 2] < H)
+    return float(through.mean())
+
+
 def _openings_on_face(face, P, Cp, H, cell=0.05):
     """Holes in a face: cells crossed by camera rays and free of surface points."""
     a, b, sign, c0 = face["axis"], 1 - face["axis"], face["sign"], face["c"]
@@ -254,10 +272,13 @@ def _openings_on_face(face, P, Cp, H, cell=0.05):
     lab, n = ndimage.label(hole)
     out = []
     for k, (su, sz) in enumerate(ndimage.find_objects(lab), 1):
-        w, hgt = (su.stop - su.start) * cell, (sz.stop - sz.start) * cell
         fill = float((lab[su, sz] == k).mean())
+        w, hgt = (su.stop - su.start + 2) * cell, (sz.stop - sz.start + 2) * cell
         if w < 0.55 or hgt < 0.55 or fill < 0.6:
             continue
+        # the occupancy dilation above shaved one cell off every side of the hole: give it back
+        su = slice(max(su.start - 1, 0), min(su.stop + 1, nu))
+        sz = slice(max(sz.start - 1, 0), min(sz.stop + 1, nz))
         sill, top = sz.start * cell, sz.stop * cell
         if sill < 0.3:
             sill = 0.0
@@ -274,7 +295,8 @@ def fit_shell() -> tuple[dict, dict]:
     Cp = C[frame]
     N = _normals(P, Cp, 0.10)
 
-    faces = _faces(P, N, H)
+    all_faces = _faces(P, N, H)
+    faces = [f for f in all_faces if _seen_through(f, all_faces, P, Cp, H) < 0.5]
     # pair opposite faces of the same wall body
     used, walls = set(), []
     for i, f in enumerate(faces):
