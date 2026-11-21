@@ -1,9 +1,8 @@
 # Capture Studio
 
-Capture Studio turns a phone RGB video of a construction site into an editable BIM model that
-an AI agent designs on through an MCP server. Every design edit is checked against a building-code
-profile, site-safety rules and a MuJoCo rigid-body stability test; decisions that need a human
-are put to the user in a minimal three.js viewer, and the result is exported as IFC4 + GLB + MJCF.
+Capture Studio turns a phone video of a factory into manufacturing-grade AI analysis and process engineering.
+
+It uses LingBot to generate a point cloud from the video and then our agent semantically and spatially segments the points into objects for a process. The segmented objects are an editable BIM model that an AI agent can redesign or replicate through an MCP. Every design edit is checked against a building-code profile, site-safety rules and a MuJoCo rigid-body stability test; decisions that need a human are put to the user in a minimal three.js viewer, and the result is exported as IFC4 + GLB + MJCF. The semantic segmentation of the point cloud, 3d reconstruction, BIM editing and CAD are all powered by Gemini 4.
 
 Pipeline:
 
@@ -33,8 +32,6 @@ runs on CPU. `python scripts/mcp_call.py --list` lists the tools. Tests: `pytest
 ## Driving it with an agent
 
 The server's MCP `instructions` describe the workflow; any MCP client picks them up.
-
-**Claude Code** — `.mcp.json` in the repo root (or `claude mcp add --transport http capture-studio http://127.0.0.1:8642/mcp`):
 
 ```json
 { "mcpServers": { "capture-studio": { "type": "http", "url": "http://127.0.0.1:8642/mcp" } } }
