@@ -434,3 +434,4 @@ body[data-mode="live"] .rs small { max-width: 260px; }
 #btn-auto[aria-pressed="true"] i { background: var(--ok); }
 body[data-mode="live"]:not([data-stage="design"]) #agent-state { display: none !important; }
 @media (max-width: 1600px) { body[data-mode="live"] .masthead nav a::before { display: none; } body[data-mode="live"] .masthead nav { gap: 18px; } body[data-mode="live"] .mast-actions .button { padding: 0 14px; } }
+body[data-mode="live"] #btn-replay3 { display: none !important; }

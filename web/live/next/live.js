@@ -33,7 +33,7 @@ const LIME = 0xd6f869, MINT = 0xabddbc, CYAN = 0x67c8dc, BAD = 0xff6f61, HOLD = 
 const USE_COLOR = { work_cell: MINT, assembly: MINT, storage: 0x8a8f86, aisle: HOLD, forklift_aisle: HOLD, office: CYAN, exit_access: CYAN,
   living: CYAN, bedroom: 0xb9a6ff, kitchen: HOLD, bathroom: CYAN, corridor: 0x8a8f86 };
 const GPU = 'RTX 5070';   // the machine the precomputed LingBot-Map run used (nvidia-smi on the demo box)
-const AGENT_CMD = 'source .venv/bin/activate && python scripts/agent_gemini.py --watch --route auto';
+const AGENT_CMD = `${location.origin}/mcp`;   // the agent (Opus 5.5) connects over MCP
 const DEFAULT_BRIEF = 'Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.';
 const HERO_PROMPT = 'Add a bar feeder on the left and an interlocked guard at the front.';
 
@@ -43,7 +43,7 @@ const COPY = {
   cloud: { nav: 'Reconstruct', title: 'Point <em>cloud</em>', lede: 'LingBot-Map turns the video into a coloured, metric point cloud, frame by frame.' },
   bim: { nav: 'Rebuild', title: 'As-built <em>model</em>', lede: 'Slab, walls and scan-coloured equipment, fitted to the cloud and measured against it.' },
   explore: { nav: 'Understand', title: 'Every point, <em>known.</em>', lede: 'Each point belongs to an object. Hover to see what it is; open a machine to inspect its generated 3D model.' },
-  design: { nav: 'Design', title: 'Design with the <em>agent.</em>', lede: 'Gemini edits the floor through our MCP server. Every change is checked for code, safety and physics.' },
+  design: { nav: 'Design', title: 'Design with the <em>agent.</em>', lede: 'The agent edits the floor through our MCP server. Every change is checked for code, safety and physics.' },
   deliver: { nav: 'Deliver', title: 'Ready to <em>build.</em>', lede: 'Every client requirement met, code, safety and physics checks passed, and the site actions that remain.' },
 };
 if (LIVE) { COPY.capture.lede = 'The uploaded walkthrough, normalised on this server. Everything after this is computed from it, now.'; COPY.cloud.lede = 'LingBot-Map reconstructs the space from the video on this machine’s GPU, frame by frame.'; }
@@ -802,6 +802,7 @@ $('#hero-form').onsubmit = (ev) => { ev.preventDefault(); sendMessage($('#hero-p
 
 // ---------------------------------------------------------------- server I/O
 let S = null, REC = null;
+const recModelName = () => (typeof REC?.model === 'string' ? REC.model : typeof REC?.model_name === 'string' ? REC.model_name : typeof REC?.agent_model === 'string' ? REC.agent_model : '');
 async function getRecorded() {
   if (!REC) REC = await (await fetch(new URL('recorded-run.json', import.meta.url))).json();
   return REC;
@@ -967,7 +968,7 @@ function renderBimFacts(m) {
   if (!m) { $('#bim-facts').innerHTML = fact('–', 'no model yet'); $('#bim-fine').textContent = ''; return; }
   const c = count(m), sc = m.scan ?? {};
   $('#bim-facts').innerHTML = fact(c.wall ?? 0, 'walls') + fact((c.door ?? 0) + (c.window ?? 0), 'doors + windows')
-    + (POINTS() ? fact(OBJ.list.length, 'objects segmented,<br>labelled by Gemini') : fact(c.equipment ?? 0, 'equipment, coloured<br>from the scan'))
+    + (POINTS() ? fact(OBJ.list.length, 'objects segmented<br>and labelled') : fact(c.equipment ?? 0, 'equipment, coloured<br>from the scan'))
     + (sc.fit_p50_mm != null ? fact(`${Math.round(sc.fit_p50_mm)}<small>mm</small>`, `median fit to the scan<br>P95 ${Math.round(sc.fit_p95_mm)} mm`, 'hl') : '');
   $('#bim-fine').textContent = [sc.perimeter && `Perimeter ${sc.perimeter}.`, sc.scale_source && `Scale: ${sc.scale_source}.`].filter(Boolean).join(' ');
 }
@@ -1065,7 +1066,7 @@ async function startReplay({ label = null } = {}) {     // the recorded design r
   D.queue = st.history.slice(bi + 1); D.evMs = clamp(26000 / Math.max(1, D.queue.length), 700, 1300);
   if (live) { D.liveShown = S.history.length; D.histSig = histSig(S); }
   D.feedT = st.history[bi]?.t ?? 0; D.settled = false; D.anim = null;
-  feedClear(label ?? `recorded run · ${st._recorded?.model ?? 'Gemini'}`);
+  feedClear(label ?? `recorded run${recModelName() ? ' · ' + recModelName() : ''}`);
   if (stage !== 'design') setStage('design');
   const brief = st.messages?.[0]; if (brief) { D.seenMsg.add(brief.id); feedAdd('you', brief.text); }
   if (st.requirements?.length) feedAdd('note', `Client wishes recorded: ${st.requirements.map((r) => r.text).join(' · ')}`, 'add_requirement');
@@ -1549,8 +1550,8 @@ function stageStatus(st) {      // pending | running | done | failed | stopped (
 }
 function friendlyError(st) {
   const e = String(st?.error ?? '');
-  if (st?.key === 'objects' && /401|api key|API_KEY|unauthori|permission/i.test(e + (LV.job?.log ?? []).join(' '))) return 'Gemini segmentation unavailable: API key rejected';
-  if (st?.key === 'objects' && stageStatus(st) === 'stopped') return 'Gemini segmentation did not finish (stopped)';
+  if (st?.key === 'objects' && /401|api key|API_KEY|unauthori|permission/i.test(e + (LV.job?.log ?? []).join(' '))) return 'Object segmentation unavailable: no detector available';
+  if (st?.key === 'objects' && stageStatus(st) === 'stopped') return 'Object segmentation did not finish (stopped)';
   return e ? e.replace(/^\w+Error: /, '').slice(0, 90) : stageStatus(st) === 'stopped' ? 'stopped before finishing' : '';
 }
 function stageNumbers(st) {
@@ -1559,7 +1560,7 @@ function stageNumbers(st) {
     case 'video': return st.width ? `${st.width}×${st.height} · ${mmss(st.duration ?? 0)}` : '';
     case 'reconstruct': { const m = /(\d+) frames in ([\d.]+)s/.exec(st.detail ?? ''); return m ? `${m[1]} frames · ${Math.round(+m[2])} s GPU` : ''; }
     case 'cloud': return st.points ? `${fmt(st.points)} points` : '';
-    case 'objects': return st.objects != null ? `${st.objects} objects` : '';
+    case 'objects': { const n = Array.isArray(st.objects) ? st.objects.length : st.objects; return n != null ? `${n} objects` : ''; }
     case 'model': return st.counts ? [st.counts.wall && `${st.counts.wall} walls`, st.counts.equipment && `${st.counts.equipment} equipment`].filter(Boolean).join(' · ') : '';
   }
   return '';
@@ -1582,16 +1583,18 @@ function renderRail() {
 }
 function renderWaiting() {      // the current step's data is not there yet: say exactly which stage it waits on
   const w = $('#waiting'), drop = $('#drop'); if (!w) return;
+  $('#btn-send').disabled = !LV.have.model || (D.mode === 'replay' && D.queue.length > 0);
   const showDrop = stage === 'capture' && (LV.showDrop || LV.uploading || !LV.have.video);
   drop.hidden = !showDrop;
   const need = (NEEDS[stage] ?? []).filter((k) => !LV.have[k === 'reconstruct' ? 'cloud' : k]);
   if (showDrop || !need.length) { w.hidden = true; document.body.classList.remove('waiting-data'); return; }
   const k = need.find((x) => ['running', 'failed', 'stopped'].includes(stageStatus(stageOf(x)))) ?? need[0], st = stageOf(k), ss = stageStatus(st);
-  const title = st?.title ?? PIPE.find((p) => p[0] === k)?.[1];
+  const title = { reconstruct: 'LingBot-Map reconstruction', cloud: 'Dense point cloud', model: 'As-built model', video: 'Video', objects: 'Object segmentation' }[k] ?? st?.title;
+  const missing = st?.state === 'done' && LV.missAt?.[k === 'reconstruct' ? 'cloud' : k];
   w.hidden = false; document.body.classList.add('waiting-data');
   w.className = 'waiting ' + ss;
-  w.querySelector('h3').textContent = ss === 'running' ? `${title}…` : ss === 'failed' || ss === 'stopped' ? `${title}: failed` : `Waiting for ${title.toLowerCase()}`;
-  w.querySelector('p').textContent = ss === 'running' ? `running for ${stageClock(st)} on this machine` : ss === 'failed' || ss === 'stopped' ? friendlyError(st) || 'see the pipeline log'
+  w.querySelector('h3').textContent = missing ? `${title}: files not found` : ss === 'running' ? `${title}…` : ss === 'failed' || ss === 'stopped' ? `${title}: failed` : `Waiting for: ${title}`;
+  w.querySelector('p').textContent = missing ? 'The stage reports done but its products are not on the server (were they replaced by a newer upload?). Retrying.' : ss === 'running' ? `running for ${stageClock(st)} on this machine` : ss === 'failed' || ss === 'stopped' ? friendlyError(st) || 'see the pipeline log'
     : !LV.job?.started ? 'Upload a video in step 01 to start.' : ss === 'skipped' ? 'This stage did not run: an earlier stage failed.' : 'Queued: it starts when the stages before it finish.';
 }
 function resetLive() {
@@ -1623,10 +1626,10 @@ async function liveTick(initial = false) {
   LV.job = job; if (LV.started === null) { LV.started = job.started ?? 0; BUST = job.started ? String(Math.round(job.started)) : ''; }
   const landed = [];
   for (const k of ['video', 'cloud', 'objects', 'model']) {
-    const st = stageOf(k), ready = st ? st.state === 'done' : (initial && job.state === 'idle');   // idle + files on disk: try them
+    const st = stageOf(k), ready = !!st && st.state === 'done' && Date.now() - (LV.missAt?.[k] ?? 0) > 15000;
     if (ready && !LV.have[k] && !LV['loading_' + k]) {
       LV['loading_' + k] = true;
-      try { if (await loadProduct(k)) landed.push(k); } finally { LV['loading_' + k] = false; }
+      try { if (await loadProduct(k)) { landed.push(k); delete (LV.missAt ??= {})[k]; } else (LV.missAt ??= {})[k] = Date.now(); } finally { LV['loading_' + k] = false; }
     }
   }
   if (landed.length && !initial) {
@@ -1658,7 +1661,7 @@ function uploadVideo(file) {
 }
 async function liveBoot() {
   S = emptyState();
-  $('#hint-cmd').textContent = `CAPTURE_STUDIO_MCP=${location.origin}/mcp python scripts/agent_gemini.py --watch`;
+  $('#hint-cmd').textContent = `Opus 5.5 over the MCP server · ${location.origin}/mcp`;
   const inp = $('#drop-file'), zone = $('#drop');
   inp.onchange = () => uploadVideo(inp.files[0]);
   zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('over'); });
@@ -1680,7 +1683,7 @@ function animateStage(t) {
   if (stage === 'bim' && POINTS()) {
     applyViewLayers(st);
     if (cloudU && VIEW === 'cloud' && !segTouched) cloudU.uSeg.value = st > 3600 ? 1 : 0;
-    if (st > 3600 && !animateStage.segCap) { animateStage.segCap = true; caption('segmented', `${OBJ.list.length} objects found in the cloud · labelled by Gemini`); }
+    if (st > 3600 && !animateStage.segCap) { animateStage.segCap = true; caption('segmented', `${OBJ.list.length} objects found in the cloud · segmented and labelled`); }
   } else if (stage === 'bim') {
     if (cloudU) { cloudU.uOpModel.value = 1 - 0.8 * ease(span(st, 900, 3800)); cloudU.uOpScan.value = 1; cloudU.uReveal.value = meta.n; cloudU.uFresh.value = 1; cloudU.uSeg.value = 0; }
     if (!wipeUser) {
@@ -1779,7 +1782,7 @@ $('#brief').onsubmit = (ev) => { ev.preventDefault(); if (LIVE) sendMessage($('#
 $('#btn-recloud').onclick = () => setStage('cloud');
 $('#btn-rebim').onclick = () => setStage('bim');
 $('#btn-export').onclick = doExport;
-$('#hint-cmd').textContent = AGENT_CMD;
+$('#hint-cmd').textContent = `Opus 5.5 over the MCP server · ${location.origin}/mcp`;
 $('#btn-copy').onclick = () => navigator.clipboard?.writeText(AGENT_CMD).then(() => toast('Command copied'), () => toast('Copy failed: select the command', true));
 $('#btn-reset').onclick = () => {     // local playback reset: nothing on the server changes
   D.mode = 'idle'; D.queue = []; D.model = null; D.src = null; D.anim = null; D.settled = true; closeHero(); setSelection([]);
@@ -1842,7 +1845,10 @@ window.__demo = {
 // ---------------------------------------------------------------- boot
 setStage(STAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'capture', { push: false });
 if (LIVE) await liveBoot();
-else await Promise.all([loadCloud().then(loadObjects), getRecorded().then((r) => { S = r; D.liveShown = S.history.length; })]);
+else {
+  await Promise.all([loadCloud().then(loadObjects), getRecorded().then((r) => { S = r; D.liveShown = S.history.length; })]);
+  const n = recModelName(); for (const id of ['#rec-tag', '#rec-tag2']) if ($(id)) $(id).textContent = 'Recorded run' + (n ? ' · ' + n : '');
+}
 $('#loading').classList.add('off');
 resize();
 setStage(stage, { push: false });

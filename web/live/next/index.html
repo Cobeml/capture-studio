@@ -125,27 +125,18 @@
             <textarea id="brief-text" rows="3" readonly>Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.</textarea>
             <div id="suggest" class="suggest"></div>
             <div class="brief-actions">
-              <button class="button primary big" id="btn-send" type="submit">Run design →</button><span class="rec-tag">Recorded run · Gemini 4 Carbon</span>
+              <button class="button primary big" id="btn-send" type="submit">Run design →</button><span class="rec-tag" id="rec-tag">Recorded run</span>
               <button class="button secondary" id="btn-replay2" type="button">Replay recorded</button>
             </div>
           </form>
           <div id="hint" class="hint-card" hidden>
-            <b>No agent activity yet.</b> Start the agent in a terminal:
-            <code id="hint-cmd">source .venv/bin/activate &amp;&amp; python scripts/agent_gemini.py --watch --route auto</code>
-            <span class="hint-actions"><button class="button secondary small" id="btn-copy" type="button">Copy command</button><button class="button secondary small" id="btn-replay3" type="button">Replay recorded instead</button></span>
+            <b>No agent is connected.</b> The design step needs Opus 5.5 connected to this server over MCP:
+            <code id="hint-cmd">Opus 5.5 over the MCP server</code>
+            <span class="hint-actions"><button class="button secondary small" id="btn-copy" type="button">Copy MCP URL</button><button class="button secondary small" id="btn-replay3" type="button">Replay recorded instead</button></span>
           </div>
           <div id="scen-wrap" class="scen-wrap" hidden>
             <span class="mono-label">Pre-generated scenarios · instant, then replayed</span>
             <div id="scen" class="scen-row"></div>
-          </div>
-          <div class="tiers" title="Gemini model tiers, routed by task difficulty (agent_gemini.py --route auto)">
-            <span class="mono-label">Gemini tiers · intelligence by task difficulty</span>
-            <div class="tier-row">
-              <span class="tier"><b>Carbon</b><small>plan · fix</small></span>
-              <span class="tier"><b>Neon</b><small>edit</small></span>
-              <span class="tier"><b>Argon</b><small>sign-off</small></span>
-              <span class="tier"><b>Hydrogen</b><small>read · wrap up</small></span>
-            </div>
           </div>
           <div class="feed-head"><span class="mono-label">Agent activity</span><span id="feed-src" class="mono-label dim"></span><button id="btn-skip" class="link-btn" hidden>Skip to end ▸▸</button></div>
           <ol id="feed" class="feed"></ol>
@@ -159,7 +150,7 @@
           <ul id="dl-warn" class="dl-list"></ul>
           <div class="mono-label">Added by the agent</div>
           <ul id="dl-added" class="dl-list"></ul>
-          <p class="fine">Recorded run · Gemini 4 Carbon</p>
+          <p class="fine" id="rec-tag2">Recorded run</p>
           <div hidden><ol id="next"></ol><div id="qty"></div><ul id="files"></ul><span id="export-status"></span><button id="btn-export"></button><div id="review"></div></div>
         </div>
       </aside>

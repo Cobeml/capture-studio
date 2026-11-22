@@ -531,7 +531,9 @@ function setStage(s, opts = {}) {
   }
   if (s === 'replan' || s === 'modeledit') {
     const H = S?.history ?? [], act = s === 'replan' ? 'move_element' : 'add_part';
-    const i0 = H.findIndex((h) => h.action === act), start = i0 > 0 ? i0 - 1 : Math.max(0, baseIdx);
+    let i0 = H.findLastIndex((h) => h.action === act);           // replay the LAST run of edits (earlier ones belong to the base design)
+    while (i0 > 0 && H[i0 - 1].action === act) i0--;
+    const start = i0 > 0 ? i0 - 1 : Math.max(0, baseIdx);
     if (H[start]) applyModel(H[start].model); else if (base) applyModel(base);
     queue = i0 > 0 ? H.slice(start + 1) : []; shown = H.length; held = !!opts.hold;
     busyUntil = stageAt + 2000; pills(H[start]?.validation ?? null); S && (S._liveShown = null);

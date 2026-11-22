@@ -18,7 +18,7 @@ from . import store
 
 JOB = store.DATA / "job.json"
 STAGES = [("video", "Preparing video"), ("reconstruct", "LingBot-Map reconstruction"), ("cloud", "Dense point cloud"),
-          ("objects", "Gemini segments and names objects"), ("model", "As-built model"), ("done", "Ready")]
+          ("objects", "Segment and name objects"), ("model", "As-built model"), ("done", "Ready")]
 
 
 def read() -> dict:

@@ -9,3 +9,4 @@ trimesh
 ifcopenshell
 huggingface_hub
 pytest
+transformers>=4.50          # local open-vocabulary object detector (Grounding DINO) when no Gemini key

@@ -130,8 +130,85 @@ DETECT_PROMPT = """This is a frame from a walkthrough video of a machine shop. D
 Return JSON: a list of {"box_2d": [ymin, xmin, ymax, xmax] normalised to 0-1000, "label": short specific name}."""
 
 
+# Local open-vocabulary fallback (no API key needed): Grounding DINO tiny, run from models/grounding-dino-tiny.
+LOCAL_DET_DIR = ROOT / "models" / "grounding-dino-tiny"
+LOCAL_PROMPT = ("machine. lathe. milling machine. drill press. saw. grinder. shelf. storage rack. workbench. table. desk. "
+                "chair. sofa. cabinet. cart. counter. refrigerator. tank. drum. compressor. conveyor. robot. monitor. whiteboard.")
+FUNCTIONS = {   # one honest generic line per coarse category when no vision-language labeller is available
+    "machine": "Production equipment detected in the scan.", "robot": "Automation equipment detected in the scan.",
+    "rack": "Storage: shelving or racking.", "bench": "Work surface: a table, bench or desk.", "tank": "Container: a tank or drum.",
+    "conveyor": "Material handling: a conveyor.", "cart": "Mobile storage: a cart or trolley.", "cabinet": "Enclosed storage: a cabinet or locker.",
+    "other": "Object detected in the scan.",
+}
+_DETECTOR = None
+
+
+def detector_mode() -> str:
+    """'gemini' when a key is set and accepted, else 'local' (Grounding DINO). CAPTURE_STUDIO_DETECTOR=gemini|local overrides."""
+    global _DETECTOR
+    if _DETECTOR:
+        return _DETECTOR
+    forced = os.environ.get("CAPTURE_STUDIO_DETECTOR", "auto").lower()
+    if forced in ("gemini", "local"):
+        _DETECTOR = forced
+        return _DETECTOR
+    try:
+        client = gemini_client()
+        client.models.get(model=GEMINI_DET_MODEL)          # one cheap authenticated request: is the key accepted?
+        _DETECTOR = "gemini"
+    except Exception as ex:  # no key, rejected key, no network, no SDK
+        print(f"  Gemini unavailable ({type(ex).__name__}: {str(ex)[:120]}); using the local detector")
+        _DETECTOR = "local"
+    return _DETECTOR
+
+
+def detect_local(frames: np.ndarray, keyframes: list[int], box_thr=0.36, text_thr=0.3, batch=4) -> dict:
+    """Grounding DINO boxes with the detector's own phrase as the label; cached in detections_local.json."""
+    path = work_dir() / "detections_local.json"
+    cache = json.loads(path.read_text()) if path.exists() else {}
+    todo = [k for k in keyframes if str(k) not in cache]
+    if todo:
+        import torch
+        from PIL import Image
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        if not LOCAL_DET_DIR.exists():
+            raise RuntimeError(f"local detector not found at {LOCAL_DET_DIR}")
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        proc = AutoProcessor.from_pretrained(LOCAL_DET_DIR)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(LOCAL_DET_DIR).to(dev).eval()
+        Hh, Ww = frames.shape[1:3]
+        t0 = time.time()
+        for b in range(0, len(todo), batch):
+            ks = todo[b:b + batch]
+            imgs = [Image.fromarray(cv2.cvtColor(frames[k], cv2.COLOR_BGR2RGB)) for k in ks]
+            inp = proc(images=imgs, text=[LOCAL_PROMPT] * len(imgs), return_tensors="pt").to(dev)
+            with torch.no_grad():
+                outp = model(**inp)
+            res = proc.post_process_grounded_object_detection(outp, inp.input_ids, threshold=box_thr, text_threshold=text_thr,
+                                                              target_sizes=[(Hh, Ww)] * len(imgs))
+            for k, r in zip(ks, res):
+                out = []
+                labels = r.get("text_labels") or r.get("labels")
+                for box, score, lab in zip(r["boxes"].tolist(), r["scores"].tolist(), labels):
+                    x0, y0, x1, y1 = box
+                    w, h = x1 - x0, y1 - y0
+                    lab = str(lab).strip()
+                    if not lab or w < 24 or h < 24 or w * h > 0.8 * Ww * Hh:      # no tiny boxes, no whole-frame boxes
+                        continue
+                    out.append({"box": [round(v, 1) for v in (x0, y0, x1, y1)], "label": lab[:60], "score": round(float(score), 3)})
+                cache[str(k)] = out
+            if (b // batch) % 10 == 0:
+                print(f"  local detect {min(b + batch, len(todo))}/{len(todo)}  {time.time() - t0:.0f}s")
+        del model
+        torch.cuda.empty_cache()
+        path.write_text(json.dumps(cache))
+    return {int(k): v for k, v in cache.items() if int(k) in set(keyframes)}
+
+
 def detect(frames: np.ndarray, keyframes: list[int], workers=8) -> dict:
     """{frame index: [{"box": [x0, y0, x1, y1] px in the video frame, "label": str}]}, cached per frame."""
+    if detector_mode() == "local":
+        return detect_local(frames, keyframes)
     path = work_dir() / "detections.json"
     cache = json.loads(path.read_text()) if path.exists() else {}
     todo = [k for k in keyframes if str(k) not in cache]
@@ -256,7 +333,8 @@ def lift_masks(Pm, valid, masks, dets, cams, ceiling):
             pos = np.clip(np.searchsorted(allk, nb), 0, len(allk) - 1)
             dil = pos[allk[pos] == nb]
             recs.append({"frame": f, "det": j, "label": dets[f][j]["label"], "vox": ids, "dil": dil,
-                         "area": int(m.sum()), "box": dets[f][j]["box"], "depth": float(np.median(d))})
+                         "area": int(m.sum()), "box": dets[f][j]["box"], "depth": float(np.median(d)),
+                         "score": dets[f][j].get("score")})
     return recs, allk, seen
 
 
@@ -354,7 +432,8 @@ KEYWORDS = [  # Gemini's free-text detector label -> coarse category (used for m
     ("robot", "robot"), ("conveyor", "conveyor"), ("drum", "tank"), ("barrel", "tank"), ("tank", "tank"),
     ("cart", "cart"), ("dolly", "cart"), ("trolley", "cart"), ("cabinet", "cabinet"), ("locker", "cabinet"),
     ("rack", "rack"), ("shelv", "rack"), ("shelf", "rack"), ("bench", "bench"), ("table", "bench"),
-    ("stand", "bench"), ("desk", "bench"),
+    ("stand", "bench"), ("desk", "bench"), ("counter", "bench"),
+    ("monitor", "other"), ("chair", "other"), ("sofa", "other"), ("whiteboard", "other"), ("refrigerator", "cabinet"),
 ]
 
 
@@ -679,6 +758,8 @@ def run(labels_from: str | None = None, write_previews=True) -> dict:
     frames = video_frames(n=S)
     T["frames"] = time.time() - t0
     dets = detect(frames, list(range(S)))
+    if not any(dets.values()):                       # fail fast and say why, instead of an empty concatenate later
+        raise RuntimeError(f"no objects detected in any of {S} frames (detector: {detector_mode()})")
     T["detect"] = time.time() - t0 - sum(T.values())
     masks = sam_masks(frames, dets, (H, W))
     T["sam"] = time.time() - t0 - sum(T.values())
@@ -729,6 +810,8 @@ def run(labels_from: str | None = None, write_previews=True) -> dict:
             src = {o.get("source_key", o["key"]): o for o in src["objects"]}
         labels = {k: {f: v.get(f) for f in ("label", "category", "function", "confidence", "label_source")}
                   for k, v in src.items()}
+    elif detector_mode() == "local":
+        labels = {}                                  # no vision-language labeller without a key: detector names below
     else:
         labels = label_objects(objs, frames, masks)
     T["label"] = time.time() - t0 - sum(T.values())
@@ -739,9 +822,12 @@ def run(labels_from: str | None = None, write_previews=True) -> dict:
         source = lb.pop("label_source", None) or "gemini"
         if not lb.get("label"):
             from collections import Counter
-            lb = {"label": Counter(r["label"] for r in o["dets"]).most_common(1)[0][0], "category": "other",
-                  "function": "", "confidence": 0.3}
-            source = "detector"
+            name = Counter(r["label"] for r in o["dets"]).most_common(1)[0][0]
+            scores = [r.get("score") for r in o["dets"] if r.get("score") is not None]
+            cat = coarse_category(name)
+            lb = {"label": name[:1].upper() + name[1:], "category": cat, "function": FUNCTIONS.get(cat, FUNCTIONS["other"]),
+                  "confidence": round(float(np.mean(scores)), 2) if scores else 0.3}
+            source = "grounding-dino" if detector_mode() == "local" else "detector"
         rv = review.get("labels", {}).get(o["source_key"])
         if rv:
             lb.update({k: v for k, v in rv.items() if k in ("label", "category", "function", "confidence")})
@@ -766,11 +852,14 @@ def run(labels_from: str | None = None, write_previews=True) -> dict:
         }
         out.append(rec)
         o.update(rec)
+    det_desc = "Grounding DINO tiny (local, open vocabulary)" if detector_mode() == "local" else "Gemini (gemini-4-carbon)"
     doc = {"version": 1, "glb_up": "Y", "frame": "model (frame.json), metres, Z up",
-           "segmentation": "Gemini (gemini-4-carbon) boxes on all keyframes -> SAM 2.1 masks -> lifted through "
+           "segmentation": det_desc + " boxes on all keyframes -> SAM 2.1 masks -> lifted through "
                            "LingBot-Map points -> fused across frames by 3D voxel overlap (cannot-link: different "
                            "boxes in one frame) -> visibility-normalised voxel vote",
-           "labels": "Gemini vision on the best 3 views per object, reviewed by hand where marked",
+           "labels": ("detector phrase per object (majority over its detections); no vision-language labeller"
+                      if detector_mode() == "local" and not labels_from else
+                      "Gemini vision on the best 3 views per object, reviewed by hand where marked"),
            "objects": out}
     sd = scan_dir()
     pl.astype(np.uint16).tofile(sd / "cloud_labels.bin")
