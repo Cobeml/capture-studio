@@ -354,7 +354,7 @@ body[data-stage="cloud"] #loading { display: none; }
 body.clean .agent-state, body.clean .keys, body.clean .hint-card { display: none !important; }
 
 /* ---------------------------------------------------------------- deployed demo: recorded run only */
-#agent-state, #hint, #scen-wrap, .tiers, #mentions, #suggest, #hero-form, #btn-replay2, [data-act="ask"], #ex-ask, #ex-sel .button { display: none !important; }
+#agent-state, #hint, #scen-wrap, .tiers, #suggest, #hero-form, #btn-replay2, [data-act="ask"], #ex-ask, #ex-sel .button { display: none !important; }
 .rec-tag { align-self: center; font: 12px var(--mono); color: var(--dim); }
 .brief textarea[readonly] { color: #d9d9d0; cursor: default; }
 .dl-list { list-style: none; margin: 0; padding: 0; display: grid; }
@@ -435,3 +435,14 @@ body[data-mode="live"] .rs small { max-width: 260px; }
 body[data-mode="live"]:not([data-stage="design"]) #agent-state { display: none !important; }
 @media (max-width: 1600px) { body[data-mode="live"] .masthead nav a::before { display: none; } body[data-mode="live"] .masthead nav { gap: 18px; } body[data-mode="live"] .mast-actions .button { padding: 0 14px; } }
 body[data-mode="live"] #btn-replay3 { display: none !important; }
+
+.followups { display: grid; gap: 8px; }
+.followups[hidden] { display: none; }
+.fu-row { display: grid; gap: 6px; }
+.fu { display: grid; gap: 2px; text-align: left; padding: 10px 14px; border-radius: 12px; border: 1px solid #d6f86955; background: #151a10; }
+.fu b { font-size: 14.5px; font-weight: 600; color: var(--ok); letter-spacing: -.01em; }
+.fu small { font-size: 13px; color: var(--muted); line-height: 1.35; }
+.fu:hover { border-color: var(--ok); }
+
+#gl, #hero-gl { filter: brightness(var(--gl-bright, 1)); }
+body.clean .viewsw { display: none !important; }

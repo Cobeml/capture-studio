@@ -24,6 +24,7 @@ const dataURL = (p) => (BUST ? p + (p.includes('?') ? '&' : '?') + 'v=' + BUST :
 let vnow = 0;
 const now = () => (CAPTURE ? vnow : performance.now());
 document.body.classList.toggle('clean', CLEAN); document.body.classList.toggle('capture', CAPTURE);
+if (+PARAMS.get('bright') > 0) document.documentElement.style.setProperty('--gl-bright', String(+PARAMS.get('bright')));   // recording: lift the 3D views a little
 const playVideo = () => { if (!CAPTURE) video.play().catch(() => {}); };
 const rad = THREE.MathUtils.degToRad;
 
@@ -101,7 +102,7 @@ function shot(t) {
   }
   if (stage === 'bim') return { target: sceneC, az: camAz0 + s * 0.04, el: 0.8, dist: fitDist(sceneR) * 0.82 };
   const w = focus.w, tgt = sceneC.clone(), low = stage === 'explore' && POINTS();
-  const base = { az: camAz0 + s * (stage === 'deliver' ? 0.03 : low ? 0.012 : 0.008), el: low ? 0.5 : stage === 'explore' ? 0.82 : POINTS() ? 0.82 : 0.98, d0: fitDist(sceneR) * (low ? 0.56 : 0.84) };
+  const base = { az: camAz0 + s * (stage === 'deliver' ? 0.03 : low ? 0.012 : 0.008), el: low ? 0.5 : stage === 'explore' ? 0.82 : POINTS() ? 0.78 : 0.98, d0: fitDist(sceneR) * (low ? 0.47 : stage === 'design' && POINTS() ? 0.7 : 0.84) };
   if (focus.az != null && focus.c) {
     tgt.lerp(focus.c, w);
     return { target: tgt, az: base.az + wrap(focus.az - base.az) * w, el: base.el + (focus.el - base.el) * w, dist: base.d0 + (focus.dist - base.d0) * w };
@@ -156,10 +157,10 @@ void main() {
   bool sel = false; for (int i = 0; i < 8; i++) if (k > 0 && abs(uSel[i] - aLabel) < 0.5) sel = true;
   bool hov = k > 0 && abs(uHover - aLabel) < 0.5;
   if (k > 0 && uSeg > 0.5) vColor = mix(vColor, hue(aLabel), 0.5);
-  if (sel) vColor = mix(vColor, uHi, 0.42) * 1.15; else if (hov) vColor = mix(vColor, vec3(1.0), 0.38);
-  else if (uDim > 0.5) vColor *= 0.45;
+  if (sel) vColor = mix(vColor, uHi, 0.42) * 1.15; else if (hov) vColor = mix(vColor, vec3(1.0, 1.0, 0.82), 0.6);
+  else if (uDim > 0.5) vColor *= 0.72;
   vSide = dot(uWipe.xyz, wp.xyz) + uWipe.w; vLabel = aLabel;
-  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6 + (hov || sel ? 0.35 : 0.0)), uMinPx, uMaxPx);
+  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6 + (hov || sel ? 0.5 : 0.0)), uMinPx + (hov || sel ? 1.0 : 0.0), uMaxPx);
   gl_Position = projectionMatrix * mvPosition;
   #include <clipping_planes_vertex>
 }`;
@@ -246,11 +247,29 @@ async function loadObjects() {
     for (const o of OBJ.list) {
       if (!o.mesh) continue;
       const node = gltf.scene.getObjectByName(o.mesh); if (!node) continue;
-      const meshes = []; node.traverse((m) => { if (m.isMesh) meshes.push({ geo: m.geometry, matrix: m.matrixWorld.clone(), material: m.material }); });
+      const meshes = []; node.traverse((m) => { if (m.isMesh) meshes.push({ geo: m.geometry, matrix: m.matrixWorld.clone(), material: prepHeroMaterial(m.material, m.geometry, o) }); });
       if (meshes.length) OBJ.meshes.set(o.mesh, meshes);
     }
   }).catch(() => {}));
   await Promise.all(jobs);
+}
+function prepHeroMaterial(mat, geo, o) {
+  // Texture wins over vertex colours (multiplying both darkens the model). ImageBitmaps from GLTFLoader are redrawn
+  // into a canvas so the same texture also uploads in the second WebGL context (the hero inspector).
+  const m = mat.clone();
+  if (m.map) {
+    m.vertexColors = false;
+    const img = m.map.image;
+    if (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) {
+      const c = document.createElement('canvas'); c.width = img.width; c.height = img.height; c.getContext('2d').drawImage(img, 0, 0);
+      const t = m.map.clone(); t.image = c; t.needsUpdate = true; m.map = t;
+    }
+  } else if (geo.attributes.color && String(o.vertex_colors ?? '').toLowerCase() === 'srgb' && !geo.userData.linearised) {
+    const a = geo.attributes.color, cc = new THREE.Color();     // sRGB-encoded COLOR_0 -> linear, once
+    for (let i = 0; i < a.count; i++) { cc.setRGB(a.getX(i), a.getY(i), a.getZ(i), THREE.SRGBColorSpace); a.setXYZ(i, cc.r, cc.g, cc.b); }
+    a.needsUpdate = true; geo.userData.linearised = true;
+  }
+  return m;
 }
 const Y2Z = new THREE.Matrix4().makeRotationX(Math.PI / 2);   // glTF Y-up -> our Z-up: (x, y, z) -> (x, -z, y)
 const objOf = (e) => (e?.object_key ? OBJ.byKey.get(e.object_key) : null);
@@ -615,14 +634,15 @@ function labelIndexOf(id) {
   if (id.startsWith('obj:')) return OBJ.byKey.get(id.slice(4))?.index ?? 0;
   return objOf(groups.get(id)?.el ?? Object.values(pickModel()?.elements ?? {}).find((x) => x.id === id))?.index ?? 0;
 }
-function setSelection(ids) {
-  SEL = ids.slice(0, 8); refreshFlags();
+let SEL_INFO = true;   // false while a recorded request highlights its referenced objects (no info card over the scene)
+function setSelection(ids, { info = true } = {}) {
+  SEL = ids.slice(0, 8); SEL_INFO = info; refreshFlags();
   if (cloudU) { const a = new Array(8).fill(0); SEL.forEach((id, i) => (a[i] = labelIndexOf(id))); cloudU.uSel.value = a; }
   renderInfo(); renderMentions(); renderExplorePanel();
 }
 function renderInfo() {
   const box = $('#info'), id = SEL.at(-1), inf = infoOf(id);
-  if (!inf || HERO || !$('#signoff').hidden || stage === 'cloud') { box.hidden = true; return; }
+  if (!inf || HERO || !$('#signoff').hidden || stage === 'cloud' || !SEL_INFO) { box.hidden = true; return; }
   box.hidden = false;
   const sz = inf.size ? `${inf.size[0].toFixed(2)} × ${inf.size[1].toFixed(2)} m` : '–', ht = inf.size?.[2] != null ? `${inf.size[2].toFixed(2)} m` : '–';
   const more = SEL.length > 1 ? `<div class="info-more">${SEL.length} selected · ${SEL.slice(0, -1).map((x) => esc(shortName(infoOf(x)?.label))).join(', ')}</div>` : '';
@@ -777,13 +797,23 @@ function renderHero(fit = false) {
     hero.group = g; hero.scene.add(g);
     if (fit) {
       const box = new THREE.Box3().setFromObject(g), c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
-      hero.controls.target.copy(c); hero.camera.position.set(c.x + r * 1.9, c.y - r * 2.3, c.z + r * 1.3);
+      // start from the side the camera filmed (mean of the object's best-view camera positions, in the object's own frame)
+      let az = -Math.atan2(2.3, 1.9);
+      const ob = objOf(e) ?? (String(HERO).startsWith('obj:') ? OBJ.byKey.get(String(HERO).slice(4)) : null);
+      if (ob?.views?.length && meta?.cameras) {
+        let mx = 0, my = 0, k = 0; for (const i of ob.views) { const cm = meta.cameras[i]; if (cm) { mx += cm[0]; my += cm[1]; k++; } }
+        if (k) az = Math.atan2(my / k - (e.pos?.[1] ?? ob.pos[1]), mx / k - (e.pos?.[0] ?? ob.pos[0])) - rad(e.yaw_deg ?? ob.yaw_deg ?? 0);
+      }
+      const dd = r * 2.6;
+      hero.controls.target.copy(c); hero.camera.position.set(c.x + dd * Math.cos(az), c.y + dd * Math.sin(az), c.z + r * 1.1);
+      hero.controls.autoRotate = true;
     }
     const inf = infoOf(HERO);
     $('#hero-title').textContent = inf.label;
     $('#hero-fn').textContent = inf.fn ?? '';
     $('#hero-meta').innerHTML = `<span class="chip">${esc(inf.cat ?? '')}</span><span class="chip hero">generated 3D model</span>${inf.size ? `<span class="chip">${inf.size[0].toFixed(1)} × ${inf.size[1].toFixed(1)} × ${inf.size[2].toFixed(1)} m</span>` : ''}${inf.conf != null ? `<span class="chip">${Math.round(inf.conf * 100)} % label confidence</span>` : ''}`;
-    $('#hero-parts').innerHTML = inf.parts.length ? inf.parts.map((p) => `<li><i style="background:${esc(p.color ?? '#ff8a3d')}"></i>${esc(p.name)}<small>${p.shape ?? 'box'} · ${p.s.map((v) => v.toFixed(2)).join(' × ')} m</small></li>`).join('') : '<li class="empty">No added parts yet. Ask the agent below.</li>';
+    renderStills($('#hero'), objOf(e) ?? (String(HERO).startsWith('obj:') ? OBJ.byKey.get(String(HERO).slice(4)) : null));
+    $('#hero-parts').innerHTML = inf.parts.length ? inf.parts.map((p) => `<li><i style="background:${esc(p.color ?? '#ff8a3d')}"></i>${esc(p.name)}<small>${p.shape ?? 'box'} · ${p.s.map((v) => v.toFixed(2)).join(' × ')} m</small></li>`).join('') : (LIVE ? '<li class="empty">No added parts yet. Ask the agent below.</li>' : '<li class="empty">No added parts yet.</li>');
   }
 }
 function closeHero() {
@@ -901,7 +931,7 @@ function setStage(s, { push = true } = {}) {
   $('#btn-back').disabled = i === 0;
   $('#btn-next').textContent = i < N - 1 ? `${COPY[STAGES[i + 1]].nav} →` : 'Back to start ↺';
   if (push) history.replaceState(null, '', '#' + s);
-  if (HERO && s !== 'explore' && s !== 'design') closeHero();
+  if (HERO && s !== 'explore') closeHero();
   if (s !== prevStage || DEFAULT_VIEW[s]) setView(POINTS() ? (DEFAULT_VIEW[s] ? 'cloud' : 'model') : s === 'explore' && !OBJ.labels ? (LIVE ? 'cloud' : 'model') : DEFAULT_VIEW[s] ?? 'model');
   if (s !== 'cloud') { video.removeAttribute('style'); $('#vp-note').removeAttribute('style'); }
   // scene layers
@@ -1059,17 +1089,31 @@ function enterDesign() {
   D.busyUntil = Math.max(D.busyUntil, now() + 900);
 }
 
-async function startReplay({ label = null } = {}) {     // the recorded design run, played locally (never a live agent)
-  const live = false, st = await getRecorded();
+let FOLLOW = null;
+async function getFollowups() {
+  if (!FOLLOW) { try { FOLLOW = await (await fetch(new URL('recorded-followups.json', import.meta.url))).json(); } catch { FOLLOW = {}; } }
+  return FOLLOW;
+}
+async function startFollowup(k) {      // a recorded follow-on request (re-plan / model edit), continuing from the finished run
+  const F = (await getFollowups())[k]; if (!F) return;
+  await startReplay({ st: F, request: F.request, select: F.selected, label: `recorded follow-on · ${F.title}`, keepFocus: k === 'model_edit' });
+  if (k === 'model_edit' && F.selected?.[0]) flyTo(F.selected[0]);   // close on the machine before its parts appear
+}
+async function startReplay({ label = null, st: given = null, request = null, select = null, keepFocus = false } = {}) {     // recorded runs, played locally (never a live agent)
+  const live = false, st = given ?? await getRecorded();
+  if ($('#followups')) $('#followups').hidden = true;
+  D.keepFocus = keepFocus;
   const bi = baselineIdx(st.history);
   D.mode = 'replay'; D.src = live ? 'live' : 'recorded'; D.srcState = st; if (HERO) closeHero(); setSelection([]);
-  D.queue = st.history.slice(bi + 1); D.evMs = clamp(26000 / Math.max(1, D.queue.length), 700, 1300);
+  D.queue = st.history.slice(bi + 1); D.evMs = clamp(26000 / Math.max(1, D.queue.length), 700, 1300) / (+PARAMS.get('pace') || 1);
   if (live) { D.liveShown = S.history.length; D.histSig = histSig(S); }
   D.feedT = st.history[bi]?.t ?? 0; D.settled = false; D.anim = null;
   feedClear(label ?? `recorded run${recModelName() ? ' · ' + recModelName() : ''}`);
   if (stage !== 'design') setStage('design');
-  const brief = st.messages?.[0]; if (brief) { D.seenMsg.add(brief.id); feedAdd('you', brief.text); }
-  if (st.requirements?.length) feedAdd('note', `Client wishes recorded: ${st.requirements.map((r) => r.text).join(' · ')}`, 'add_requirement');
+  if (select?.length) setSelection(select, { info: false });
+  if (request) { $('#brief-text').value = request; feedAdd('you', request + (select?.length ? ' · ' + select.map((id) => '@' + shortName(infoOf(id)?.label ?? id)).join(' ') : '')); }
+  const brief = request ? null : st.messages?.[0]; if (brief) { D.seenMsg.add(brief.id); feedAdd('you', brief.text); $('#brief-text').value = brief.text; }
+  if (!request && st.requirements?.length) feedAdd('note', `Client wishes recorded: ${st.requirements.map((r) => r.text).join(' · ')}`, 'add_requirement');
   $('#btn-send').textContent = 'Running…'; $('#btn-send').disabled = true;
   clearWorld(); applyModel(st.history[bi].model, { cloudAnim: false }); D.model = st.history[bi].model; D.val = null;
   pills(null); egressKey = ''; overlay.clear(); $('#signoff').hidden = true;
@@ -1101,6 +1145,7 @@ function stepDesign(t) {
     pills(v); drawEgress(v);
     if (!HERO) {
       if (ev.action === 'add_part' && ev.focus?.[0]) flyTo(ev.focus[0]);           // close-up as parts appear on the machine
+      else if (ev.action === 'validate' && focus.az != null) { /* keep the close-up while the check runs */ }
       else { if (focus.az != null) focus = { ...focus, az: null, w: 0 }; focusOn(ev.focus); }
     }
     caption(ev.actor === 'human' ? 'you' : ev.action, ev.caption); eventRow(ev);
@@ -1128,11 +1173,18 @@ function settle(quiet = false) {
     if (D.mode === 'replay') D.mode = 'live';
   } else applyModel(D.model, { flag: failFlags(st.validation) });
   const v = recorded ? st.validation : S.validation;
-  pills(v); drawEgress(v); if (!HERO) { focus.goal = 0; }
+  pills(v); drawEgress(v); if (!HERO && !D.keepFocus) { focus.goal = 0; }
   if (recorded) { D.model = st.model; applyModel(st.model, { flag: failFlags(st.validation) }); }
   const warn = v?.counts?.warn ?? 0;
   caption('done', `${liveSummary(v) || 'Design complete'}${warn ? ` · ${warn} site action${warn > 1 ? 's' : ''}` : ''}`);
   $('#btn-send').textContent = LIVE ? 'Send to agent →' : 'Replay run ↺'; $('#btn-send').disabled = false;
+  if (!LIVE && $('#followups')) getFollowups().then((F) => {
+    const box = $('#followups'), keys = Object.keys(F).filter((k) => !k.startsWith('_'));
+    if (!keys.length) return;
+    box.querySelector('.fu-row').innerHTML = keys.map((k) => `<button class="fu" data-k="${esc(k)}"><b>${esc(F[k].title)}</b><small>${esc(F[k].request)}</small></button>`).join('');
+    box.querySelectorAll('.fu').forEach((b) => (b.onclick = () => startFollowup(b.dataset.k)));
+    box.hidden = false;
+  });
 }
 function showSignoff(st) {
   if (!LIVE) return;   // the deployed demo plays a recorded run: no live sign-off
@@ -1726,10 +1778,14 @@ function applyViewLayers(st) {   // cloud (points) / blend / model (boxes)
   if (cloud) cloud.visible = true;
   for (const r of groups.values()) {
     const e = r.el, shell = SHELL.has(e.kind);
-    r.group.visible = !cloudView || e.id === HERO || e.provenance === 'proposed' || (pts ? shell : (!OBJ.labels && SEL.includes(e.id)));
+    r.group.visible = !cloudView || e.id === HERO || e.provenance === 'proposed' || (e.boxes ?? []).some((b) => b.part) || (pts ? shell : (!OBJ.labels && SEL.includes(e.id)));
     if (shell) setGhost(r, cloudView && pts);
   }
   if (heroTemp) heroTemp.visible = true;
+  if (cloudU && !HERO) {     // a scanned machine shown as its model with added parts: hide its own points under it
+    const r = [...groups.values()].find((g) => g.el.provenance === 'scanned' && elementMeshes(g.el) && (g.el.boxes ?? []).some((b) => b.part));
+    cloudU.uHide.value = cloudView && r ? labelIndexOf(r.el.id) : 0;
+  }
   if (cloudU) { cloudU.uSize.value = pointSize() * (cloudView ? 1 : 0.8); cloudU.uMinPx.value = pts && cloudView ? 2.2 : 1.5; cloudU.uMaxPx.value = 64; cloudU.uRound.value = 1; cloudU.uLo.value = 0; }
   overlay.visible = (!cloudView || pts) && (stage === 'design' || stage === 'deliver');
   $('#labels').style.visibility = cloudView && !pts ? 'hidden' : '';
@@ -1812,7 +1868,7 @@ const seekVideo = (t) => new Promise((res) => {
   video.addEventListener('seeked', done); video.currentTime = t;
 });
 const cursor = { x: 960, y: 560, fx: 960, fy: 560, tx: 960, ty: 560, t0: 0, ms: 1 };
-function status() { return { stage, t: now() - stageAt, queue: D.queue.length, mode: D.mode, settled: D.settled, hero: HERO, sel: SEL.slice(), objects: OBJ.list.length, points: POINTS(), videoT: stage === 'cloud' ? videoT() : null, question: !!S?.questions?.find((q) => q.answer == null) }; }
+function status() { return { tag: $('#vp-tag')?.textContent, caption: $('#vp-caption span')?.textContent, stage, t: now() - stageAt, queue: D.queue.length, mode: D.mode, settled: D.settled, hero: HERO, sel: SEL.slice(), objects: OBJ.list.length, points: POINTS(), videoT: stage === 'cloud' ? videoT() : null, question: !!S?.questions?.find((q) => q.answer == null) }; }
 window.__demo = {
   capture: CAPTURE, status,
   go: (s2) => { setStage(s2); return status(); },
@@ -1855,5 +1911,5 @@ setStage(stage, { push: false });
 if (CAPTURE) { video.pause(); window.__demo.ready = true; }
 else { const loop = (t) => { requestAnimationFrame(loop); tick(t); }; requestAnimationFrame(loop); }
 if (!LIVE) { grabThumbs(); setTimeout(watchScan, 20000); }
-window.__live = { project: (id) => window.__demo.project(id),
+window.__live = { hero, cu: () => cloudU && { hover: cloudU.uHover.value, dim: cloudU.uDim.value, seg: cloudU.uSeg.value, view: VIEW, HOVER }, project: (id) => window.__demo.project(id),
   heroBox: () => { const r = groups.get(HERO); return r && new THREE.Box3().setFromObject(r.group); }, groups, OBJ, S: () => S, setSelection, openHero, setView, pick: (x, y) => pick(x, y), stage: () => stage, D, MOVE };   // test hook

@@ -119,6 +119,24 @@ VO_V2 = [
               "and Hydrogen for the lighter steps."),
     dict(id="end", text="Capture Studio. From phone video to a buildable plan."),
 ]
+# v3: no model-brand talking points; every object is its own labelled set of points, one hero object gets a
+# high-fidelity 3D model, layout edits move the points.  No export claim.
+VO_V3 = [
+    dict(id="intro", text="This is Capture Studio."),
+    dict(id="walk", text="Walk the floor with your phone."),
+    dict(id="cloud", text="LingBot-Map turns the video into a dense 3D point cloud.",
+         qwen="LingBot Map turns the video into a dense three-D point cloud."),
+    dict(id="scene", text="Every machine is segmented, named and understood, each its own labelled set of points."),
+    dict(id="click", text="Click one to find it in the video. The lathe gets a high-fidelity 3D model.",
+         qwen="Click one to find it in the video. The lathe gets a high fidelity three-D model."),
+    dict(id="cnc", text="Ask for a change, and an AI agent designs it with you: placing machines, guarding them, "
+                        "keeping exits clear, and running a MuJoCo physics test on every change.",
+         qwen="Ask for a change, and an A.I. agent designs it with you: placing machines, guarding them, "
+              "keeping exits clear, and running a Moo-Joe-Co physics test on every change."),
+    dict(id="risky", text="Anything risky, it asks you first."),
+    dict(id="replan", text="Re-plan the floor, and the points move with it."),
+    dict(id="end", text="Capture Studio. From phone video to a buildable plan."),
+]
 CUT = "v1"
 TTS_SUFFIX = ""
 
@@ -131,15 +149,26 @@ VO_START = 10.30          # "This is Capture Studio." starts over the title card
 END_CARD_MAX = 56.70      # end card fades in (moved earlier if the last line is long); last line starts after it
 END_CARD = END_CARD_MAX
 GAP_AFTER = dict(intro=0.30, walk=0.30, cloud=0.35, bim=0.35, agent=0.30, cnc=0.35, risky=0.35, intel=0.35, ifc=0.0,
-                 scene=0.35)
+                 scene=0.35, click=0.35, replan=0.0)
 SPARE_AFTER = ("risky", 1.2)    # (chunk id, max seconds): unused VO time is given to the shot after this line
-EXTRA_GAP_W = dict(intro=0.3, walk=0.3, cloud=0.5, cnc=0.8, risky=0.6, intel=0.5)   # v2 only
+EXTRA_GAP_W = dict(intro=0.3, walk=0.3, cloud=0.5, cnc=0.8, risky=0.6, intel=0.5)   # v2/v3 only
+EXTRA_GAP_CAP = 1.0
 
 
 def use_cut(cut):
-    """Switch every output path / VO table to the v2 recut (v1 files stay untouched)."""
-    global CUT, VO, TTS_SUFFIX, OUT, OUT_NOMUSIC, CACHE, SPARE_AFTER, FOLLOW_DIRS, STAGE_DIRS
+    """Switch every output path / VO table to the v2 / v3 recut (v1 files stay untouched)."""
+    global CUT, VO, TTS_SUFFIX, OUT, OUT_NOMUSIC, CACHE, SPARE_AFTER, FOLLOW_DIRS, STAGE_DIRS, EXTRA_GAP_W, EXTRA_GAP_CAP
     CUT = cut
+    if cut == "v3":
+        VO = VO_V3
+        TTS_SUFFIX = "_v3"
+        OUT = FINAL / "capture_studio_1min_v3.mp4"
+        OUT_NOMUSIC = FINAL / "capture_studio_1min_v3_nomusic.mp4"
+        CACHE = FINAL / "cache_v3"
+        SPARE_AFTER = ("click", 1.6)     # spare time first goes to the hero-model hold
+        EXTRA_GAP_W = dict(walk=0.6, cloud=1.6, scene=1.3, cnc=1.2, risky=1.0)   # leftover lands after "replan"
+        EXTRA_GAP_CAP = 1.6
+        return
     if cut != "v2":
         return
     VO = VO_V2
@@ -303,7 +332,7 @@ def _reexec(venv: Path, argv):
     if not py.exists():
         sys.exit(f"missing venv {venv}; see header of this script")
     env = dict(os.environ, HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
-    return subprocess.run([str(py), str(Path(__file__).resolve())] + argv + ["--cut", CUT], env=env).returncode
+    return subprocess.run([str(py), str(Path(__file__).resolve())] + argv + ["--cut", CUT, "--out", str(OUT)], env=env).returncode
 
 
 def say_text(chunk, engine):
@@ -544,13 +573,13 @@ def build_vo(voice):
         chunks[:-1] = [time_stretch(c, factor) for c in chunks[:-1]]
     gaps = {k: v / factor for k, v in GAP_AFTER.items()}
     spare = avail - (sum(len(c) for c in chunks[:-1]) / SR + sum(gaps[c["id"]] for c in VO[:-1]))
-    if CUT == "v2" and spare > SPARE_AFTER[1]:
+    if CUT in ("v2", "v3") and spare > SPARE_AFTER[1]:
         # v2 script is shorter: after the centrepiece hold, spread what is left over the other pauses
         rest = spare - SPARE_AFTER[1]
         tot_w = sum(EXTRA_GAP_W.values())
         for k, wgt in EXTRA_GAP_W.items():
-            gaps[k] = gaps.get(k, 0) + min(1.0, rest * wgt / tot_w)
-        log(f"v2: {spare:.2f}s spare -> {SPARE_AFTER[1]}s after {SPARE_AFTER[0]}, rest over pauses")
+            gaps[k] = gaps.get(k, 0) + min(EXTRA_GAP_CAP, rest * wgt / tot_w)
+        log(f"{CUT}: {spare:.2f}s spare -> {SPARE_AFTER[1]}s after {SPARE_AFTER[0]}, rest over pauses")
     total = np.zeros(int(DUR * SR), dtype=np.float32)
     t = VO_START
     timeline = []
@@ -919,7 +948,12 @@ class Reader:
             sh, sw = int(round(sh * maxw / sw / 2) * 2), maxw
         self.w, self.h = sw, sh
         vf = f"setpts=(PTS-STARTPTS)/{speed},fps={FPS},scale={sw}:{sh}:flags=lanczos,setsar=1"
-        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-ss", f"{max(0, t_in):.3f}", "-i", self.path,
+        if Path(self.path).suffix.lower() in (".png", ".jpg", ".jpeg"):     # still image (v3 stand-ins / stills)
+            src = ["-loop", "1", "-framerate", str(FPS), "-i", self.path]
+            vf = f"scale={sw}:{sh}:flags=lanczos,setsar=1,format=rgb24"
+        else:
+            src = ["-ss", f"{max(0, t_in):.3f}", "-i", self.path]
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", *src,
                "-vf", vf, "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10 ** 8)
         self.last = None
@@ -1264,6 +1298,157 @@ def build_shots_v2(timeline, follow, follow_n, design_src, cues):
     return S, cuts
 
 
+# ======================================================================================
+# v3 shot table.  One row per slot, in timeline order.  A slot runs from its `at` anchor to the next slot's.
+#   at     (chunk id, word prefix or None = chunk start, offset s)      anchors come from the VO word timeline
+#   src    clip (mp4) or still (png/jpg) relative to the repo; `tin` = first second used, `speed` playback rate
+#   crop   (cx, cy, zoom) punch-in (0..1 of the source frame), `dz` = extra zoom over the shot (slow push)
+#   label  pill text shown bottom-left (None = no pill); `pill2` = second pill stacked above the agent pill
+#   standin  used for the draft while `src` does not exist yet (same keys; missing keys fall back to the row)
+# Overrides without editing code: demo/ui_v3/shots_v3.json = {"slot": {"tin": 3.2, "crop": [0.5, 0.5, 1.2]}, ...}
+# Special rows: "fly" wipes src -> src2 at word `wipe` (matched-camera follow clips, same frame count);
+#               "segments" continues the fly-through camera (`continue`) and fades cloud -> tinted segments.
+# ======================================================================================
+UI3 = "demo/ui_v3"
+FV2 = "demo/follow_v2"
+V3_SHOTS = [
+    dict(slot="capture", at=("walk", None, -0.08), src=f"{UI3}/capture.mp4", tin=0.0, crop=(0.5, 0.5, 1.0), dz=0.04,
+         label="PHONE VIDEO",
+         standin=dict(src=f"{FV2}/follow_video.mp4", tin=1.2, crop=(0.5, 0.5, 1.0))),
+    dict(slot="fly", at=("cloud", None, -0.10), src=f"{FV2}/follow_video.mp4", src2=f"{FV2}/follow_cloud.mp4",
+         tin=4.0, wipe=("cloud", "point", -0.30, 0.90), crop=(0.5, 0.5, 1.0), dz=0.0,
+         label="PHONE VIDEO", label2="DENSE POINT CLOUD · LINGBOT-MAP"),
+    dict(slot="reconstruct", at=("cloud", "$end", 0.25), src=f"{UI3}/reconstruct.mp4", tin=0.0,
+         crop=(0.5, 0.5, 1.0), dz=0.04, label="RECONSTRUCTED ON THIS MACHINE'S GPU",
+         standin=dict(src="demo/live_upload/live_1920_cloud.png", crop=(0.5, 0.5, 1.0), dz=0.06)),
+    dict(slot="segments", at=("scene", None, -0.15), src=f"{FV2}/follow_cloud.mp4", src2=f"{FV2}/follow_cloud_tint.mp4",
+         tin=12.0, fade=0.7, crop=(0.5, 0.5, 1.0), dz=0.03, label="EVERY OBJECT · ITS OWN SET OF POINTS"),
+    dict(slot="understand", at=("scene", "named", -0.25), src=f"{UI3}/understand.mp4", tin=0.0,
+         crop=(0.5, 0.5, 1.0), dz=0.05, label="SEGMENTED · NAMED · UNDERSTOOD",
+         standin=dict(src="demo/final/rec/v2_stages/05_understand.mp4", tin=4.1, crop=(0.69, 0.66, 2.2), dz=0.08,
+                      grade="lift")),
+    dict(slot="click", at=("click", None, -0.10), src=f"{UI3}/click.mp4", tin=0.0, crop=(0.5, 0.5, 1.0), dz=0.04,
+         label="CLICK · FOUND IN THE VIDEO",
+         standin=dict(src=f"{FV2}/follow_cloud_labeled.mp4", tin=0.2, crop=(0.42, 0.40, 1.35), dz=0.06)),
+    dict(slot="hero", at=("click", "lathe", -0.35), src=f"{UI3}/hero_lathe.mp4", tin=0.0, crop=(0.5, 0.5, 1.0),
+         dz=0.05, label="HIGH-FIDELITY MODEL · HAAS SL-30 LATHE",
+         standin=dict(src="demo/hero/hero_obj_05_turntable.jpg", tin=0.0, crop=(0.74, 0.26, 1.95), dz=0.10)),
+    dict(slot="ask", at=("cnc", None, -0.10), src=f"{UI3}/design.mp4", tin=0.0, crop=(0.5, 0.5, 1.0), dz=0.05,
+         agent=True,
+         standin=dict(src="demo/final/rec/v2_stages/04_agentic_design.mp4", tin=0.3, crop=(0.45, 0.50, 1.30))),
+    dict(slot="place", at=("cnc", "placing", -0.25), src=f"{UI3}/design.mp4", tin=6.0, crop=(0.5, 0.5, 1.0), dz=0.06,
+         agent=True,
+         standin=dict(src="demo/final/rec/v2_stages/04_agentic_design.mp4", tin=6.6, speed=1.6,
+                      crop=(0.54, 0.40, 2.0), dz=0.10)),
+    dict(slot="guard", at=("cnc", "guarding", -0.20), src=f"{UI3}/design.mp4", tin=11.0, crop=(0.5, 0.5, 1.0),
+         dz=0.06, agent=True,
+         standin=dict(src="demo/final/rec/v2_stages/04_agentic_design.mp4", tin=11.6, crop=(0.58, 0.45, 1.70))),
+    dict(slot="physics", at=("cnc", "physics", -0.45), src=f"{UI3}/design.mp4", tin=17.0, crop=(0.5, 0.5, 1.0),
+         dz=0.05, agent=True, pill2="MUJOCO PHYSICS TEST · EVERY CHANGE",
+         standin=dict(src="demo/final/rec/v2_stages/04_agentic_design.mp4", tin=17.6, crop=(1.0, 0.0, 1.25))),
+    dict(slot="risky", at=("risky", None, -0.10), src=f"{UI3}/design.mp4", tin=20.0, speed=0.8, crop=(0.5, 0.5, 1.0),
+         dz=0.08, agent=True, pill2="ASKS YOU BEFORE ANYTHING RISKY",
+         standin=dict(src="demo/final/rec/v2_stages/04_agentic_design.mp4", tin=20.0, speed=0.7,
+                      crop=(0.50, 0.48, 1.50))),
+    dict(slot="replan", at=("replan", None, -0.10), src=f"{UI3}/replan.mp4", tin=0.0, crop=(0.5, 0.5, 1.0), dz=0.05,
+         label="RE-PLAN · THE POINTS MOVE",
+         standin=dict(src=f"{FV2}/follow_design.mp4", tin=20.0, crop=(0.55, 0.45, 1.15))),
+    dict(slot="end", at=("$endcard", None, 0.0), src=f"{UI3}/replan.mp4", tin=-1.0, speed=0.3, crop=(0.5, 0.5, 1.10),
+         dz=0.10, grade="dimblur",
+         standin=dict(src=f"{FV2}/follow_design.mp4", tin=23.0, crop=(0.55, 0.45, 1.15))),
+]
+V3_OVERRIDES = ROOT / UI3 / "shots_v3.json"
+AGENT_PILL_V3 = "AGENT · OPUS 5.5 · MCP"
+V3_REPORT = []          # which slots used a stand-in (printed + written to shots.json)
+
+
+def _v3_rows():
+    """Resolve V3_SHOTS: overrides json, then stand-ins for clips that do not exist yet."""
+    over = json.loads(V3_OVERRIDES.read_text()) if V3_OVERRIDES.exists() else {}
+    rows = []
+    V3_REPORT.clear()
+    for r in V3_SHOTS:
+        r = dict(r)
+        r.update({k: (tuple(v) if isinstance(v, list) else v) for k, v in over.get(r["slot"], {}).items()})
+        st = r.pop("standin", None)
+        if not (ROOT / r["src"]).exists() and st:
+            r.update(st)
+            r["standin_used"] = True
+        assert (ROOT / r["src"]).exists(), f"v3 slot {r['slot']}: missing {r['src']} and no stand-in"
+        V3_REPORT.append((r["slot"], r["src"], bool(r.get("standin_used"))))
+        rows.append(r)
+    return rows
+
+
+def _anchor(timeline, at):
+    cid, word, off = at
+    if cid == "$endcard":
+        return END_CARD + off
+    c = chunk(timeline, cid)
+    if word is None:
+        return c["start"] + off
+    if word == "$end":
+        return c["end"] + off
+    return word_time(timeline, cid, word, default="start") + off
+
+
+def _src_len(path):
+    p = Path(path)
+    if p.suffix.lower() in (".png", ".jpg", ".jpeg"):
+        return 1e9
+    return float(ffprobe_json(p)["format"]["duration"])
+
+
+def build_shots_v3(timeline):
+    """v3: hype + title identical to v1/v2; product section from the V3_SHOTS table."""
+    S, cuts = [], []
+    t = 0.0
+    for key, dur, tin, z0, z1, cx, cy, grade in HYPE:
+        cuts.append(t)
+        S.append(dict(t0=t, t1=t + dur, layers=[dict(src=hype_source(key), tin=tin, z0=z0, z1=z1, c0=(cx, cy),
+                                                     c1=(cx, cy), grade=grade)], tag=key))
+        t += dur
+    cuts.append(HYPE_END)
+    rows = _v3_rows()
+    starts = [_anchor(timeline, r["at"]) for r in rows]
+    S.append(dict(t0=HYPE_END, t1=starts[0], layers=[dict(src=FINAL / "rec" / "stages" / "02_point_cloud.mp4",
+                                                          tin=TITLE_TIN, z0=1.55, z1=1.7, c0=(0.62, 0.52),
+                                                          c1=(0.62, 0.52), grade="dim")], tag="title"))
+    ends = starts[1:] + [DUR]
+    fly_t0 = fly_tin = None
+    for r, t0, t1 in zip(rows, starts, ends):
+        assert t1 > t0 + 0.2, f"v3 slot {r['slot']} too short: {t0:.2f}-{t1:.2f}"
+        cx, cy, z = r.get("crop", (0.5, 0.5, 1.0))
+        speed = r.get("speed", 1.0)
+        tin = r.get("tin", 0.0)
+        if tin < 0:                      # negative tin = that many seconds before the clip's end
+            tin = max(0.0, _src_len(ROOT / r["src"]) + tin * (t1 - t0) * speed)
+        dz = r.get("dz", 0.05)
+        L = dict(src=ROOT / r["src"], tin=tin, speed=speed, z0=z, z1=z + dz, c0=(cx, cy), c1=(cx, cy),
+                 grade=r.get("grade", "none"))
+        shot = dict(t0=t0, t1=t1, layers=[L], tag=r["slot"], agent_tag=bool(r.get("agent")),
+                    standin=bool(r.get("standin_used")), src_name=r["src"])
+        if r["slot"] == "fly":
+            fly_t0, fly_tin = t0, tin
+            tw = _anchor(timeline, r["wipe"][:3])
+            shot["layers"].append(dict(L, src=ROOT / r["src2"]))
+            shot["wipes"] = [(tw, tw + r["wipe"][3], "wipe")]
+            shot["label"] = [(r["label"], t0), (r["label2"], tw + 0.2)]
+        elif r["slot"] == "segments":
+            if fly_t0 is not None:       # same camera path: keep flying
+                L["tin"] = fly_tin + (t0 - fly_t0)
+            shot["layers"].append(dict(L, src=ROOT / r["src2"]))
+            shot["wipes"] = [(t0, t0 + r.get("fade", 0.7), "fade")]
+            shot["label"] = [(r["label"], t0 + 0.3)] if r.get("label") else []
+        else:
+            shot["label"] = [(r["label"], t0)] if r.get("label") else []
+        if r.get("pill2"):
+            shot["pill2"] = r["pill2"]
+        S.append(shot)
+    S[-1]["tag"] = "end"
+    return S, cuts
+
+
 TITLE_TIN = 10.0
 LIFT_LUT = __import__("numpy").clip(255 * (__import__("numpy").arange(256) / 255) ** 0.80 * 1.10, 0, 255).astype("uint8")
 
@@ -1271,7 +1456,9 @@ LIFT_LUT = __import__("numpy").clip(255 * (__import__("numpy").arange(256) / 255
 def render(timeline, follow, follow_n, design_src, cues, audio_path, out_path):
     import cv2
     import numpy as np
-    if CUT == "v2":
+    if CUT == "v3":
+        shots, cuts = build_shots_v3(timeline)
+    elif CUT == "v2":
         shots, cuts = build_shots_v2(timeline, follow, follow_n, design_src, cues)
     else:
         shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
@@ -1282,18 +1469,23 @@ def render(timeline, follow, follow_n, design_src, cues, audio_path, out_path):
     hype_txt = [(text_rgba(s, 124, "Black", tracking=10), t0, t1) for s, t0, t1 in HYPE_TEXT]
     title = title_card_rgba("CAPTURE STUDIO", None, 150)
     endc = title_card_rgba("CAPTURE STUDIO", "From phone video to a buildable plan.", 132)
-    agent_pill = pill_rgba("AGENT · GEMINI 4 CARBON", 28, dot=ORANGE + (255,))
-    t_agent0 = next(x["t0"] for x in shots if x["tag"] == "agent")
-    ladder = [model_ladder_rgba(k) for k in range(1, 5)]
-    ifc_pill = pill_rgba("IFC MODEL  +  NEXT STEPS", 30, dot=(52, 211, 153, 255), bg=(16, 19, 26, 230))
     label_cache = {}
     t_words = {}
-    ic = chunk(timeline, "intel")
-    for nm in ("carbon", "neon", "argon", "hydrogen"):
-        try:
-            t_words[nm] = word_time(timeline, "intel", nm)
-        except KeyError:
-            t_words[nm] = ic["start"] + 1.5
+    if CUT == "v3":     # no model ladder / IFC beat; agent pill names the design agent once, no brand talking point
+        agent_pill = pill_rgba(AGENT_PILL_V3, 28, dot=ORANGE + (255,))
+        t_agent0 = next(x["t0"] for x in shots if x.get("agent_tag"))
+        ladder = ifc_pill = None
+    else:
+        agent_pill = pill_rgba("AGENT · GEMINI 4 CARBON", 28, dot=ORANGE + (255,))
+        t_agent0 = next(x["t0"] for x in shots if x["tag"] == "agent")
+        ladder = [model_ladder_rgba(k) for k in range(1, 5)]
+        ifc_pill = pill_rgba("IFC MODEL  +  NEXT STEPS", 30, dot=(52, 211, 153, 255), bg=(16, 19, 26, 230))
+        ic = chunk(timeline, "intel")
+        for nm in ("carbon", "neon", "argon", "hydrogen"):
+            try:
+                t_words[nm] = word_time(timeline, "intel", nm)
+            except KeyError:
+                t_words[nm] = ic["start"] + 1.5
     enc = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
          "-r", str(FPS), "-i", "-", "-i", str(audio_path), "-map", "0:v", "-map", "1:a",
@@ -1362,7 +1554,13 @@ def render(timeline, follow, follow_n, design_src, cues, audio_path, out_path):
             if sh.get("agent_tag"):
                 a = min(1, (gt - t_agent0) / 0.25) if gt - t_agent0 < 0.25 else 1.0
                 overlay(frame, agent_pill, 64, H - 64 - agent_pill.shape[0], a)
-            if sh["tag"] == "ladder":
+            if sh.get("pill2"):
+                if sh["pill2"] not in label_cache:
+                    label_cache[sh["pill2"]] = pill_rgba(sh["pill2"], 28, dot=(52, 211, 153, 255))
+                p2 = label_cache[sh["pill2"]]
+                a = min(1, (gt - sh["t0"] - 0.2) / 0.25, (sh["t1"] - gt) / 0.15)
+                overlay(frame, p2, 64, H - 64 - agent_pill.shape[0] - 14 - p2.shape[0], max(0, a))
+            if sh["tag"] == "ladder" and ladder:
                 stage = 1 + sum(gt >= t_words[nm] - 0.1 for nm in ("neon", "argon", "hydrogen"))
                 a = min(1, (gt - sh["t0"]) / 0.3, (sh["t1"] - gt) / 0.25)
                 overlay(frame, ladder[stage - 1], 0, 0, a)
@@ -1465,14 +1663,20 @@ def build(voice, design_src, cues, follow_dir=None):
     import soundfile as sf
     CACHE.mkdir(parents=True, exist_ok=True)
     timeline, vo = build_vo(voice)
-    if CUT == "v2":
+    if CUT == "v3":
+        follow, follow_n = None, 0
+        shots, cuts = build_shots_v3(timeline)
+        for slot, src, sub in V3_REPORT:
+            log(f"v3 slot {slot:<12s} {'STAND-IN ' if sub else ''}{src}")
+    elif CUT == "v2":
         follow, follow_n = find_follow_v2(follow_dir)
         assert follow, "v2 needs rec/v2_follow/follow_{video,cloud,cloud_tint,cloud_labeled}.mp4"
         shots, cuts = build_shots_v2(timeline, follow, follow_n, design_src, cues)
     else:
         follow, follow_n = find_follow(follow_dir)
         shots, cuts = build_shots(timeline, follow, follow_n, design_src, cues)
-    log("follow clips:", "YES " + str(follow["video"].parent) if follow else "no (stage clips)")
+    if CUT != "v3":
+        log("follow clips:", "YES " + str(follow["video"].parent) if follow else "no (stage clips)")
     mus = synth_music(cuts, vo, timeline)
     sf.write(FINAL / f"music{TTS_SUFFIX}.wav", mus, SR, subtype="PCM_24")
     vo_st = np.stack([vo, vo], 1)
@@ -1488,8 +1692,11 @@ def build(voice, design_src, cues, follow_dir=None):
     write_srt(timeline)
     (CACHE / "shots.json").write_text(json.dumps(
         [dict(tag=s["tag"], t0=round(s["t0"], 3), t1=round(s["t1"], 3),
-              srcs=[f"{Path(L['src']).name}@{L['tin']:.2f}s x{L.get('speed', 1.0):.2f}" for L in s["layers"]])
+              srcs=[f"{Path(L['src']).name}@{L['tin']:.2f}s x{L.get('speed', 1.0):.2f}" for L in s["layers"]],
+              **({"standin": True} if s.get("standin") else {}))
          for s in shots], indent=1))
+    if CUT == "v3":
+        (FINAL / "voiceover_v3.txt").write_text("\n".join(c["text"] for c in VO) + "\n")
     log("built", OUT)
 
 
@@ -1513,7 +1720,10 @@ def whisper_final():
     print(hyp)
     cues = ["walk", "point", "bim", "gemini", "cnc", "checks", "exit", "physics", "risky", "intelligence",
             "carbon", "neon", "argon", "hydrogen", "ifc", "buildable"]
-    if CUT == "v2":
+    if CUT == "v3":
+        cues = ["walk", "dense", "point", "segmented", "named", "click", "lathe", "ask", "placing", "guarding",
+                "exits", "physics", "risky", "plan", "points", "buildable"]
+    elif CUT == "v2":
         cues = ["walk", "dense", "point", "gemini", "segmented", "named", "understood", "ask", "placing",
                 "guarding", "exit", "physics", "risky", "intelligence", "carbon", "neon", "argon", "hydrogen",
                 "buildable"]
@@ -1555,9 +1765,14 @@ def main():
     ap.add_argument("--design-cues", default=None, help="JSON dict overriding the preset cue points")
     ap.add_argument("--follow-dir", default=None)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--cut", default="v1", choices=["v1", "v2"])
+    ap.add_argument("--cut", default="v1", choices=["v1", "v2", "v3"])
+    ap.add_argument("--out", default=None, help="output mp4 (nomusic copy gets a _nomusic suffix), e.g. a draft")
     a = ap.parse_args()
     use_cut(a.cut)
+    if a.out:
+        global OUT, OUT_NOMUSIC
+        OUT = Path(a.out).resolve()
+        OUT_NOMUSIC = OUT.with_name(OUT.stem + "_nomusic.mp4")
     if a.cut == "v2" and a.design_preset == "gemini":
         a.design_preset = "v2"
     DESIGN_PRESET = a.design_preset
@@ -1583,9 +1798,9 @@ def main():
         voice = a.voice or DEFAULT_VOICE
         fetch(a.force)
         eng, vn = voice.split(":", 1)
-        if not (TTSDIR / f"{eng}_{vn}" / "align.json").exists():
+        if not (TTSDIR / f"{eng}_{vn}{TTS_SUFFIX}" / "align.json").exists():
             tts(eng, vn)
-            align(f"{eng}_{vn}")
+            align(f"{eng}_{vn}{TTS_SUFFIX}")
         build(voice, Path(a.design_src), cues, a.follow_dir)
         check()
         whisper_final()
