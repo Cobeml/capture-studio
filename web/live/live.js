@@ -16,15 +16,25 @@ const easeBack = (x) => { x = clamp(x); const c = 1.5; return 1 + (c + 1) * Math
 const span = (t, a, b) => clamp((t - a) / (b - a));
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const now = () => performance.now();
+const PARAMS = new URLSearchParams(location.search);
+const CAPTURE = PARAMS.has('capture'), CLEAN = PARAMS.has('clean');
+const LIVE = document.body.dataset.mode === 'live';   // live.html: uploaded video, live pipeline, live agent (nothing recorded)
+let BUST = '';   // live mode: job start time, so a new upload never shows cached products
+const dataURL = (p) => (BUST ? p + (p.includes('?') ? '&' : '?') + 'v=' + BUST : p);   // ?capture=1: virtual clock for scripts/record_live.py
+let vnow = 0;
+const now = () => (CAPTURE ? vnow : performance.now());
+document.body.classList.toggle('clean', CLEAN); document.body.classList.toggle('capture', CAPTURE);
+if (+PARAMS.get('bright') > 0) document.documentElement.style.setProperty('--gl-bright', String(+PARAMS.get('bright')));   // recording: lift the 3D views a little
+const playVideo = () => { if (!CAPTURE) video.play().catch(() => {}); };
 const rad = THREE.MathUtils.degToRad;
 
 // Teammate palette: lime accent, mint "editable object", cyan icon colour.
+const PROP = 0xffb37e, PROP_E = 0xff8a3d;   // proposed work: orange, as in the exported GLB
 const LIME = 0xd6f869, MINT = 0xabddbc, CYAN = 0x67c8dc, BAD = 0xff6f61, HOLD = 0xf4bf4f, SELC = 0xffffff, HOVC = 0x8fd3e2;
 const USE_COLOR = { work_cell: MINT, assembly: MINT, storage: 0x8a8f86, aisle: HOLD, forklift_aisle: HOLD, office: CYAN, exit_access: CYAN,
   living: CYAN, bedroom: 0xb9a6ff, kitchen: HOLD, bathroom: CYAN, corridor: 0x8a8f86 };
 const GPU = 'RTX 5070';   // the machine the precomputed LingBot-Map run used (nvidia-smi on the demo box)
-const AGENT_CMD = 'source .venv/bin/activate && python scripts/agent_gemini.py --watch --route auto';
+const AGENT_CMD = `${location.origin}/mcp`;   // the agent (Opus 5.5) connects over MCP
 const DEFAULT_BRIEF = 'Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.';
 const HERO_PROMPT = 'Add a bar feeder on the left and an interlocked guard at the front.';
 
@@ -34,10 +44,12 @@ const COPY = {
   cloud: { nav: 'Reconstruct', title: 'Point <em>cloud</em>', lede: 'LingBot-Map turns the video into a coloured, metric point cloud, frame by frame.' },
   bim: { nav: 'Rebuild', title: 'As-built <em>model</em>', lede: 'Slab, walls and scan-coloured equipment, fitted to the cloud and measured against it.' },
   explore: { nav: 'Understand', title: 'Every point, <em>known.</em>', lede: 'Each point belongs to an object. Hover to see what it is; open a machine to inspect its generated 3D model.' },
-  design: { nav: 'Design', title: 'Design with the <em>agent.</em>', lede: 'Gemini edits the floor through our MCP server. Every change is checked for code, safety and physics.' },
-  deliver: { nav: 'Deliver', title: 'Deliver the <em>package.</em>', lede: 'IFC, GLB and MuJoCo files, quantities, and the next steps on site.' },
+  design: { nav: 'Design', title: 'Design with the <em>agent.</em>', lede: 'The agent edits the floor through our MCP server. Every change is checked for code, safety and physics.' },
+  deliver: { nav: 'Deliver', title: 'Ready to <em>build.</em>', lede: 'Every client requirement met, code, safety and physics checks passed, and the site actions that remain.' },
 };
+if (LIVE) { COPY.capture.lede = 'The uploaded walkthrough, normalised on this server. Everything after this is computed from it, now.'; COPY.cloud.lede = 'LingBot-Map reconstructs the space from the video on this machine’s GPU, frame by frame.'; }
 const DEFAULT_VIEW = { bim: 'compare', explore: 'cloud', design: 'model', deliver: 'model' };
+const POINTS = () => !!(OBJ.labels && OBJ.list.length);   // segmented scan: objects are point sets, boxes only for proposed work
 
 // ---------------------------------------------------------------- three setup (Z up, metres)
 const vp = $('#viewport');
@@ -62,7 +74,7 @@ const world = new THREE.Group(); scene.add(world);
 const overlay = new THREE.Group(); scene.add(overlay);
 const NOCLIP = () => new THREE.Plane(new THREE.Vector3(0, 0, 1), 1e6);
 const wipePlane = NOCLIP();
-let cloud = null, cloudU = null, meta = null, frustum = null, pathLine = null, pickPoints = null;
+let cloudPlan = null, cloud = null, cloudU = null, meta = null, frustum = null, pathLine = null, pickPoints = null;
 const sceneC = new THREE.Vector3(4, 3, 1); let sceneR = 9, ceiling = 2.9, cloudC = null, cloudR = null;
 let W = 1, H = 1;
 
@@ -89,10 +101,15 @@ function shot(t) {
     return { target: C, az: -0.9 + (stage === 'cloud' ? s * 0.05 : 0), el: 0.92 - (stage === 'cloud' ? k * 0.012 : 0), dist: fitDist(R) * (0.88 - (stage === 'cloud' ? k * 0.006 : 0)) };
   }
   if (stage === 'bim') return { target: sceneC, az: camAz0 + s * 0.04, el: 0.8, dist: fitDist(sceneR) * 0.82 };
-  const w = focus.w, tgt = sceneC.clone();
+  const w = focus.w, tgt = sceneC.clone(), low = stage === 'explore' && POINTS();
+  const base = { az: camAz0 + s * (stage === 'deliver' ? 0.03 : low ? 0.012 : 0.008), el: low ? 0.5 : stage === 'explore' ? 0.82 : POINTS() ? 0.78 : 0.98, d0: fitDist(sceneR) * (low ? 0.47 : stage === 'design' && POINTS() ? 0.7 : 0.84) };
+  if (focus.az != null && focus.c) {
+    tgt.lerp(focus.c, w);
+    return { target: tgt, az: base.az + wrap(focus.az - base.az) * w, el: base.el + (focus.el - base.el) * w, dist: base.d0 + (focus.dist - base.d0) * w };
+  }
   if (focus.c && w > 0) tgt.lerp(focus.c, (HERO ? 0.9 : 0.4) * w);
-  const d0 = fitDist(sceneR) * 0.84, d1 = HERO && focus.r ? Math.max(fitDist(focus.r) * 1.6, 5) : d0 * 0.86;
-  return { target: tgt, az: camAz0 + s * (stage === 'deliver' ? 0.03 : 0.008), el: stage === 'explore' ? 0.82 : 0.98, dist: d0 + (d1 - d0) * w };
+  const d1 = HERO && focus.r ? Math.max(fitDist(focus.r) * 1.6, 5) : base.d0 * 0.86;
+  return { target: tgt, az: base.az, el: base.el, dist: base.d0 + (d1 - base.d0) * w };
 }
 function camStage() { camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = now(); camAz0 = cam.az; manual = false; }
 function updateCamera(t) {
@@ -115,7 +132,7 @@ function updateCamera(t) {
 const CLOUD_VS = `
 #include <common>
 #include <clipping_planes_pars_vertex>
-uniform float uReveal, uFresh, uSize, uScale, uHover, uSeg, uHide, uDim; uniform float uSel[8]; uniform vec3 uHi; uniform vec4 uWipe;
+uniform float uReveal, uLo, uMaxPx, uMinPx, uFresh, uSize, uScale, uHover, uSeg, uHide, uDim; uniform float uSel[8]; uniform vec3 uHi; uniform vec4 uWipe;
 uniform sampler2D uMove;
 attribute float aLabel;
 varying vec3 vColor; varying float vSide; varying float vLabel;
@@ -132,7 +149,7 @@ void main() {
     p.xy = vec2(c * d.x - s * d.y, s * d.x + c * d.y) + a.zw;
     vis = b.y;
   }
-  if (id >= uReveal || vis < 0.5 || (uHide > 0.5 && abs(aLabel - uHide) < 0.5)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  if (id >= uReveal || id < uLo || vis < 0.5 || (uHide > 0.5 && abs(aLabel - uHide) < 0.5)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
   vec4 wp = modelMatrix * vec4(p, 1.0);
   vec4 mvPosition = viewMatrix * wp;
   float fresh = 1.0 - smoothstep(0.0, 1.0, (uReveal - id) / max(uFresh, 1.0));
@@ -140,19 +157,19 @@ void main() {
   bool sel = false; for (int i = 0; i < 8; i++) if (k > 0 && abs(uSel[i] - aLabel) < 0.5) sel = true;
   bool hov = k > 0 && abs(uHover - aLabel) < 0.5;
   if (k > 0 && uSeg > 0.5) vColor = mix(vColor, hue(aLabel), 0.5);
-  if (sel) vColor = mix(vColor, uHi, 0.72); else if (hov) vColor = mix(vColor, vec3(1.0), 0.5);
-  else if (uDim > 0.5) vColor *= 0.45;
+  if (sel) vColor = mix(vColor, uHi, 0.42) * 1.15; else if (hov) vColor = mix(vColor, vec3(1.0, 1.0, 0.82), 0.6);
+  else if (uDim > 0.5) vColor *= 0.72;
   vSide = dot(uWipe.xyz, wp.xyz) + uWipe.w; vLabel = aLabel;
-  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6 + (hov || sel ? 0.35 : 0.0)), 1.5, 64.0);
+  gl_PointSize = clamp(uSize * uScale / -mvPosition.z * (1.0 + fresh * 1.6 + (hov || sel ? 0.5 : 0.0)), uMinPx + (hov || sel ? 1.0 : 0.0), uMaxPx);
   gl_Position = projectionMatrix * mvPosition;
   #include <clipping_planes_vertex>
 }`;
 const CLOUD_FS = `
 #include <clipping_planes_pars_fragment>
-uniform float uOpScan, uOpModel; varying vec3 vColor; varying float vSide; varying float vLabel;
+uniform float uOpScan, uOpModel, uRound; varying vec3 vColor; varying float vSide; varying float vLabel;
 void main() {
   #include <clipping_planes_fragment>
-  vec2 c = gl_PointCoord - 0.5; if (dot(c, c) > 0.25) discard;
+  vec2 c = gl_PointCoord - 0.5; if (uRound > 0.5 && dot(c, c) > 0.25) discard;
 #ifdef PICK
   gl_FragColor = vec4(mod(vLabel, 256.0) / 255.0, floor(vLabel / 256.0) / 255.0, 1.0, 1.0);
 #else
@@ -163,16 +180,16 @@ const clipCeiling = new THREE.Plane(new THREE.Vector3(0, 0, -1), 2.7);
 let moveTex = null;
 
 async function loadCloud() {
-  const m = await fetch('/data/scan/meta.json'); if (!m.ok) return;
+  const m = await fetch(dataURL('/data/scan/meta.json'), LIVE ? { cache: 'no-store' } : {}); if (!m.ok) return;
   meta = await m.json();
-  const buf = await (await fetch('/data/scan/cloud.bin?v=' + meta.n)).arrayBuffer();
+  const buf = await (await fetch(dataURL('/data/scan/cloud.bin?n=' + meta.n))).arrayBuffer();
   const n = meta.n, pos = new Float32Array(buf, 0, n * 3), col = new Uint8Array(buf, n * 12, n * 3);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
   g.setAttribute('aLabel', new THREE.BufferAttribute(new Uint16Array(n), 1));
   moveTex = makeMoveTex(1);
-  cloudU = { uReveal: { value: n }, uFresh: { value: 1 }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 }, uScale: { value: 500 },
+  cloudU = { uReveal: { value: n }, uLo: { value: 0 }, uMinPx: { value: 1.5 }, uMaxPx: { value: 64 }, uRound: { value: 1 }, uFresh: { value: 1 }, uSize: { value: (meta.voxel_m ?? 0.02) * 1.35 }, uScale: { value: 500 },
     uHover: { value: 0 }, uSeg: { value: 0 }, uHide: { value: 0 }, uDim: { value: 0 }, uSel: { value: new Array(8).fill(0) }, uMove: { value: moveTex.tex },
     uHi: { value: new THREE.Color(LIME) }, uWipe: { value: new THREE.Vector4(0, 0, 0, 1) }, uOpScan: { value: 1 }, uOpModel: { value: 1 } };
   const mat = (pick) => new THREE.ShaderMaterial({ uniforms: cloudU, vertexShader: CLOUD_VS, fragmentShader: CLOUD_FS, vertexColors: true,
@@ -180,6 +197,12 @@ async function loadCloud() {
   cloud = new THREE.Points(g, mat(false));
   cloud.frustumCulled = false; cloud.visible = false; scene.add(cloud);
   pickPoints = new THREE.Points(g, mat(true)); pickPoints.frustumCulled = false; pickScene.add(pickPoints);
+  { const lo = [1e9, 1e9], hi = [-1e9, -1e9], xs = [], ys = [];   // robust plan bounds (2nd..98th percentile) for the top-down pane
+    for (let i = 0; i < n; i += 97) { xs.push(pos[i * 3]); ys.push(pos[i * 3 + 1]); }
+    xs.sort((a, b) => a - b); ys.sort((a, b) => a - b);
+    const q = (arr, f) => arr[Math.floor(f * (arr.length - 1))];
+    lo[0] = q(xs, 0.02); hi[0] = q(xs, 0.98); lo[1] = q(ys, 0.02); hi[1] = q(ys, 0.98);
+    cloudPlan = { c: new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, 0.6), ext: [hi[0] - lo[0], hi[1] - lo[1]] }; }
   ceiling = meta.ceiling_height ?? ceiling;
   cloudC = new THREE.Vector3(meta.center[0], meta.center[1], Math.min(meta.center[2] ?? 1, ceiling * 0.35));
   cloudR = Math.hypot(meta.radius, ceiling / 2);
@@ -207,28 +230,46 @@ function makeMoveTex(n) {
 
 async function loadObjects() {
   try {
-    const r = await fetch('/data/scan/objects.json'); if (!r.ok) return;
+    const r = await fetch(dataURL('/data/scan/objects.json'), LIVE ? { cache: 'no-store' } : {}); if (!r.ok) return;
     const j = await r.json();
     OBJ.list = j.objects ?? []; OBJ.up = String(j.glb_up ?? 'Y').toUpperCase();
     for (const o of OBJ.list) { OBJ.byKey.set(o.key, o); OBJ.byIndex.set(o.index, o); OBJ.maxIndex = Math.max(OBJ.maxIndex, o.index); }
   } catch { return; }
   if (cloudU) { moveTex = makeMoveTex(OBJ.maxIndex + 1); cloudU.uMove.value = moveTex.tex; MOVE.cur = new Map(); }
-  const jobs = [fetch('/data/scan/cloud_labels.bin').then(async (r) => {
+  const jobs = [fetch(dataURL('/data/scan/cloud_labels.bin')).then(async (r) => {
     if (!r.ok || !meta) return;
     const buf = await r.arrayBuffer(); if (buf.byteLength !== meta.n * 2) return;   // must match cloud.bin point order
     OBJ.labels = new Uint16Array(buf);
     if (cloud) cloud.geometry.setAttribute('aLabel', new THREE.BufferAttribute(OBJ.labels, 1));
   }).catch(() => {})];
-  if (OBJ.list.some((o) => o.mesh)) jobs.push(new GLTFLoader().loadAsync('/data/scan/objects.glb').then((gltf) => {
+  if (OBJ.list.some((o) => o.mesh)) jobs.push(new GLTFLoader().loadAsync(dataURL('/data/scan/objects.glb')).then((gltf) => {
     gltf.scene.updateMatrixWorld(true);
     for (const o of OBJ.list) {
       if (!o.mesh) continue;
       const node = gltf.scene.getObjectByName(o.mesh); if (!node) continue;
-      const meshes = []; node.traverse((m) => { if (m.isMesh) meshes.push({ geo: m.geometry, matrix: m.matrixWorld.clone(), material: m.material }); });
+      const meshes = []; node.traverse((m) => { if (m.isMesh) meshes.push({ geo: m.geometry, matrix: m.matrixWorld.clone(), material: prepHeroMaterial(m.material, m.geometry, o) }); });
       if (meshes.length) OBJ.meshes.set(o.mesh, meshes);
     }
   }).catch(() => {}));
   await Promise.all(jobs);
+}
+function prepHeroMaterial(mat, geo, o) {
+  // Texture wins over vertex colours (multiplying both darkens the model). ImageBitmaps from GLTFLoader are redrawn
+  // into a canvas so the same texture also uploads in the second WebGL context (the hero inspector).
+  const m = mat.clone();
+  if (m.map) {
+    m.vertexColors = false;
+    const img = m.map.image;
+    if (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) {
+      const c = document.createElement('canvas'); c.width = img.width; c.height = img.height; c.getContext('2d').drawImage(img, 0, 0);
+      const t = m.map.clone(); t.image = c; t.needsUpdate = true; m.map = t;
+    }
+  } else if (geo.attributes.color && String(o.vertex_colors ?? '').toLowerCase() === 'srgb' && !geo.userData.linearised) {
+    const a = geo.attributes.color, cc = new THREE.Color();     // sRGB-encoded COLOR_0 -> linear, once
+    for (let i = 0; i < a.count; i++) { cc.setRGB(a.getX(i), a.getY(i), a.getZ(i), THREE.SRGBColorSpace); a.setXYZ(i, cc.r, cc.g, cc.b); }
+    a.needsUpdate = true; geo.userData.linearised = true;
+  }
+  return m;
 }
 const Y2Z = new THREE.Matrix4().makeRotationX(Math.PI / 2);   // glTF Y-up -> our Z-up: (x, y, z) -> (x, -z, y)
 const objOf = (e) => (e?.object_key ? OBJ.byKey.get(e.object_key) : null);
@@ -311,9 +352,9 @@ const hex = (s, d) => { try { return s ? new THREE.Color(s) : new THREE.Color(d)
 function elementMaterial(e) {
   const proposed = e.provenance === 'proposed', c = hex(e.color, 0x9aa0a6), clip = [wipePlane];
   if (e.kind === 'window') return new THREE.MeshStandardMaterial({ color: proposed ? 0xe4f6c4 : 0x9fd3e6, transparent: true, opacity: 0.38, roughness: 0.1, depthWrite: false, clippingPlanes: clip });
-  if (e.kind === 'door') return new THREE.MeshStandardMaterial({ color: proposed ? LIME : c, transparent: true, opacity: 0.75, roughness: 0.7, emissive: 0, clippingPlanes: clip });
+  if (e.kind === 'door') return new THREE.MeshStandardMaterial({ color: proposed ? PROP_E : c, transparent: true, opacity: 0.75, roughness: 0.7, emissive: 0, clippingPlanes: clip });
   if (e.kind === 'slab') return new THREE.MeshStandardMaterial({ color: c.multiplyScalar(0.42), roughness: 0.95, clippingPlanes: clip });
-  if (proposed) return new THREE.MeshStandardMaterial({ color: MINT, roughness: 0.7, emissive: LIME, emissiveIntensity: 0.12, clippingPlanes: clip });
+  if (proposed) return new THREE.MeshStandardMaterial({ color: PROP, roughness: 0.7, emissive: PROP_E, emissiveIntensity: 0.18, clippingPlanes: clip });
   return new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: e.kind === 'equipment' ? 0.15 : 0, emissive: 0, clippingPlanes: clip });
 }
 function partMesh(b, e, clip) {    // add-on from add_part: {c, s, shape, color} in the element's local frame
@@ -355,7 +396,7 @@ function buildElement(e, clip = [wipePlane]) {
     if (shapes && i === 0) return;
     const geo = new THREE.BoxGeometry(...b.s), bg = new THREE.Group(); bg.position.set(...b.c);
     const mesh = new THREE.Mesh(geo, elementMaterial(e)); mesh.userData.id = e.id; mesh.castShadow = e.kind !== 'slab' && e.kind !== 'window'; mesh.receiveShadow = true; bg.add(mesh);
-    if (e.kind !== 'slab') bg.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat(proposed ? LIME : 0x1e231f, proposed ? 1 : 0.6)));
+    if (e.kind !== 'slab') bg.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat(proposed ? PROP_E : 0x1e231f, proposed ? 1 : 0.6)));
     g.add(bg);
     parts.push({ bg, bottom: b.c[2] - b.s[2] / 2, h: b.s[2], z0: e.pose.pos[2], cut: proposed || e.kind === 'slab' ? null : cutH });
   });
@@ -414,7 +455,7 @@ function applyModel(model, { animate = false, stagger = 0, flag = {}, order = nu
   shownModel = model;
   setCloudPoses(model, cloudAnim && animate);
   buildLabels(model);
-  if (HERO && !groups.has(HERO)) closeHero();
+  if (HERO && !heroEl(HERO)) closeHero();
 }
 let cutNow = Infinity;
 function updateElement(r, t) {
@@ -440,10 +481,10 @@ function refreshFlags() { groups.forEach((r) => setFlag(r, flagOf(r))); }
 function setFlag(rec, color) {
   const proposed = rec.el.provenance === 'proposed';
   rec.group.traverse((o) => {
-    if (o.isLineSegments && !o.parent?.children.some((c) => c.userData.part)) { o.material.color.setHex(color ?? (proposed ? LIME : 0x1e231f)); o.material.opacity = color ? 1 : (proposed ? 1 : 0.6); }
+    if (o.isLineSegments && !o.parent?.children.some((c) => c.userData.part)) { o.material.color.setHex(color ?? (proposed ? PROP_E : 0x1e231f)); o.material.opacity = color ? 1 : (proposed ? 1 : 0.6); }
     if (o.isMesh && o.material.emissive && rec.el.kind !== 'slab' && !o.userData.part) {
-      o.material.emissive.setHex(color ?? (proposed ? LIME : 0));
-      o.material.emissiveIntensity = color === BAD ? 0.8 : color === SELC ? 0.32 : color === HOVC ? 0.3 : color ? 0.5 : (proposed ? 0.12 : 0);
+      o.material.emissive.setHex(color ?? (proposed ? PROP_E : 0));
+      o.material.emissiveIntensity = color === BAD ? 0.8 : color === SELC ? 0.32 : color === HOVC ? 0.3 : color ? 0.5 : (proposed ? 0.18 : 0);
     }
   });
 }
@@ -566,11 +607,11 @@ function pick(cx, cy) {   // -> element id, or 'obj:<key>' for a segmented objec
   }
   return rayPick(cx, cy);
 }
-const pickEnabled = () => ['bim', 'explore', 'design', 'deliver'].includes(stage) || (stage === 'cloud' && revealDoneAt > 0);
+const pickEnabled = () => ['bim', 'explore', 'design', 'deliver'].includes(stage);
 
 function infoOf(id) {
   if (!id) return null;
-  if (id.startsWith('obj:')) { const o = OBJ.byKey.get(id.slice(4)); return o && { id, o, e: null, label: o.label, fn: o.function, cat: o.category, size: o.size, conf: o.confidence, src: o.label_source, prov: 'scanned' }; }
+  if (id.startsWith('obj:')) { const o = OBJ.byKey.get(id.slice(4)); return o && { id, o, e: null, label: o.label, fn: o.function, cat: o.category, size: o.size, conf: o.confidence, src: o.label_source, prov: 'scanned', ifc: 'segmented object', hero: isHeroId(id), parts: [] }; }
   const e = groups.get(id)?.el ?? Object.values(pickModel()?.elements ?? {}).find((x) => x.id === id); if (!e) return null;
   const o = objOf(e);
   let size = e.size;
@@ -593,14 +634,15 @@ function labelIndexOf(id) {
   if (id.startsWith('obj:')) return OBJ.byKey.get(id.slice(4))?.index ?? 0;
   return objOf(groups.get(id)?.el ?? Object.values(pickModel()?.elements ?? {}).find((x) => x.id === id))?.index ?? 0;
 }
-function setSelection(ids) {
-  SEL = ids.slice(0, 8); refreshFlags();
+let SEL_INFO = true;   // false while a recorded request highlights its referenced objects (no info card over the scene)
+function setSelection(ids, { info = true } = {}) {
+  SEL = ids.slice(0, 8); SEL_INFO = info; refreshFlags();
   if (cloudU) { const a = new Array(8).fill(0); SEL.forEach((id, i) => (a[i] = labelIndexOf(id))); cloudU.uSel.value = a; }
   renderInfo(); renderMentions(); renderExplorePanel();
 }
 function renderInfo() {
   const box = $('#info'), id = SEL.at(-1), inf = infoOf(id);
-  if (!inf || HERO || !$('#signoff').hidden) { box.hidden = true; return; }
+  if (!inf || HERO || !$('#signoff').hidden || stage === 'cloud' || !SEL_INFO) { box.hidden = true; return; }
   box.hidden = false;
   const sz = inf.size ? `${inf.size[0].toFixed(2)} × ${inf.size[1].toFixed(2)} m` : '–', ht = inf.size?.[2] != null ? `${inf.size[2].toFixed(2)} m` : '–';
   const more = SEL.length > 1 ? `<div class="info-more">${SEL.length} selected · ${SEL.slice(0, -1).map((x) => esc(shortName(infoOf(x)?.label))).join(', ')}</div>` : '';
@@ -608,6 +650,7 @@ function renderInfo() {
     <div class="info-kicker"><span class="chip">${esc(inf.cat ?? '')}</span><span class="chip ${inf.prov === 'proposed' ? 'lime' : ''}">${esc(inf.prov ?? '')}</span>${inf.moved ? '<span class="chip lime">moved</span>' : ''}${inf.hero ? '<span class="chip hero">3D model</span>' : ''}</div>
     <h3>${esc(inf.label)}</h3>
     ${inf.fn ? `<p>${esc(inf.fn)}</p>` : ''}
+    <div class="stills"></div>
     <dl><dt>footprint</dt><dd>${sz}</dd><dt>height</dt><dd>${ht}</dd>
     ${inf.conf != null ? `<dt>label confidence</dt><dd>${Math.round(inf.conf * 100)} %${inf.src ? ' · ' + esc(inf.src) : ''}</dd>` : ''}
     ${inf.ifc ? `<dt>IFC class</dt><dd>${esc(inf.ifc)}</dd>` : ''}${inf.e?.fit ? `<dt>scan fit</dt><dd>P50 ${inf.e.fit.p50} mm</dd>` : ''}
@@ -616,6 +659,7 @@ function renderInfo() {
     ${more}
     <div class="info-actions">${inf.hero ? '<button class="button primary small" data-act="hero">Open 3D model</button>' : ''}${inf.e && stage !== 'design' ? '<button class="button secondary small" data-act="ask">Ask the agent →</button>' : ''}</div>`;
   box.querySelector('.info-x').onclick = () => setSelection([]);
+  renderStills(box, inf.o ?? objOf(inf.e));
   box.querySelector('[data-act="hero"]')?.addEventListener('click', () => openHero(inf.id));
   box.querySelector('[data-act="ask"]')?.addEventListener('click', () => setStage('design'));
 }
@@ -623,31 +667,40 @@ function renderInfo() {
 // floating object labels, collision-managed (selected and hovered always win, then the largest objects)
 const olabels = new Map(); let olayoutAt = 0;
 const _v = new THREE.Vector3();
-function objectLabelCandidates() {
-  const m = shownModel ?? pickModel(); if (!m) return [];
-  return Object.values(m.elements).filter((e) => ['equipment', 'fixture'].includes(e.kind) && (e.label || objOf(e) || e.provenance === 'proposed' || SEL.includes(e.id) || HOVER === e.id));
+function labelEntries() {   // BIM elements with an object / proposed equipment, plus segmented objects with no element yet
+  const m = shownModel ?? pickModel(), out = [], covered = new Set();
+  if (m) for (const e of Object.values(m.elements)) {
+    if (!['equipment', 'fixture'].includes(e.kind)) continue;
+    const o = objOf(e); if (o) covered.add(o.key);
+    if (POINTS() && VIEW === 'cloud' && o && MOVE.cur.get(o.index)?.vis === 0) continue;
+    if (!(e.label || o || e.provenance === 'proposed' || SEL.includes(e.id) || HOVER === e.id)) continue;
+    const rec = groups.get(e.id);
+    out.push({ id: e.id, pos: rec ? rec.group.position : _p0.set(...e.pose.pos).clone(), h: e.size?.[2] ?? 1.5, text: nameOf(e), fn: e.function ?? o?.function,
+      area: e.size ? e.size[0] * e.size[1] : 1, named: !!(e.label || o) });
+  }
+  for (const o of OBJ.list) if (!covered.has(o.key)) out.push({ id: 'obj:' + o.key, pos: new THREE.Vector3(o.pos[0], o.pos[1], 0), h: o.size?.[2] ?? 1.5, text: o.label, fn: o.function, area: o.size[0] * o.size[1], named: true });
+  return out;
 }
+const _p0 = new THREE.Vector3();
 function layoutObjectLabels(t) {
-  const host = $('#olabels'), show = SHOW_LABELS && ['explore', 'design', 'deliver', 'bim'].includes(stage) || (stage === 'cloud' && revealDoneAt && SHOW_LABELS);
+  const host = $('#olabels'), show = SHOW_LABELS && ['explore', 'design', 'deliver', 'bim'].includes(stage) && !(stage === 'bim' && POINTS() && t - stageAt < 3600);
   if (!show) { host.style.display = 'none'; return; } host.style.display = '';
-  const cands = objectLabelCandidates(), seen = new Set();
-  for (const e of cands) {
+  const seen = new Set();
+  for (const e of labelEntries()) {
     seen.add(e.id);
     let L = olabels.get(e.id);
     if (!L) { L = { d: document.createElement('div') }; L.d.className = 'olabel'; host.appendChild(L.d); olabels.set(e.id, L); }
-    const rec = groups.get(e.id), pos = rec ? rec.group.position : new THREE.Vector3(...e.pose.pos);
-    const h = (e.size?.[2] ?? 1.5) + 0.25;
-    _v.set(pos.x, pos.y, pos.z + h).project(camera);
+    _v.set(e.pos.x, e.pos.y, e.pos.z + e.h + 0.25).project(camera);
     L.x = (_v.x + 1) / 2 * W; L.y = (1 - _v.y) / 2 * H; L.front = _v.z < 1;
-    const sel = SEL.includes(e.id), hov = HOVER === e.id, txt = shortName(nameOf(e)), fn = (sel || hov) && (e.function ?? objOf(e)?.function);
-    const html = `${esc(txt)}${fn ? `<small>${esc(fn.length > 70 ? fn.slice(0, 68) + '…' : fn)}</small>` : ''}`;
+    const sel = SEL.includes(e.id), hov = HOVER === e.id, txt = shortName(e.text), fn = (sel || hov) && e.fn;
+    const html = `${esc(txt)}${fn ? `<small>${esc(fn.length > 90 ? fn.slice(0, 88) + '…' : fn)}</small>` : ''}`;
     if (L.html !== html) { L.html = html; L.d.innerHTML = html; L.w = 0; }
-    L.prio = (sel ? 1e6 : 0) + (hov ? 5e5 : 0) + (e.label || objOf(e) ? 1e3 : 0) + (e.size ? e.size[0] * e.size[1] : 1);
+    L.prio = (sel ? 1e6 : 0) + (hov ? 5e5 : 0) + (e.named ? 1e3 : 0) + e.area;
     L.d.classList.toggle('on', sel || hov); L.d.style.left = L.x + 'px'; L.d.style.top = L.y + 'px';
   }
   for (const [id, L] of olabels) if (!seen.has(id)) { L.d.remove(); olabels.delete(id); }
   if (t - olayoutAt < 120) return; olayoutAt = t;
-  const maxN = W > 1100 ? 14 : 10, placed = [];
+  const maxN = HERO ? 3 : W > 1100 ? 10 : 7, placed = [];
   const list = [...olabels.values()].sort((a, b) => b.prio - a.prio);
   for (const L of list) {
     if (!L.w) { L.w = L.d.offsetWidth; L.h = L.d.offsetHeight; }
@@ -681,11 +734,11 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (stage === 'bim' && !wipeUser) { wipeUser = true; wipeX = null; }
   const r = vp.getBoundingClientRect(), id = pick(e.clientX - r.left, e.clientY - r.top);
   const multi = e.shiftKey || e.ctrlKey || e.metaKey;
-  if (!id) { if (!multi) setSelection([]); return; }
+  if (!id) { if (!multi) { setSelection([]); if (stage === 'explore' && !HERO) focus.goal = 0; } return; }
   if (multi) setSelection(SEL.includes(id) ? SEL.filter((x) => x !== id) : [...SEL, id]);
   else {
     setSelection([id]);
-    if (stage === 'explore' && isHero(groups.get(id)?.el)) openHero(id);
+    if (stage === 'explore' && isHeroId(id)) openHero(id); else if (stage === 'explore') flyTo(id);
   }
 });
 
@@ -696,19 +749,29 @@ function setView(v) {
   setHover(null);
 }
 $$('#viewsw [data-v]').forEach((b) => (b.onclick = () => setView(b.dataset.v)));
-$('#sw-seg').onclick = () => { SEGMENTS = !SEGMENTS; $('#sw-seg').setAttribute('aria-pressed', String(SEGMENTS)); };
+$('#sw-seg').onclick = () => { SEGMENTS = stage === 'bim' && !segTouched ? !(cloudU?.uSeg.value > 0.5) : !SEGMENTS; segTouched = true; $('#sw-seg').setAttribute('aria-pressed', String(SEGMENTS)); };
 $('#sw-labels').onclick = () => { SHOW_LABELS = !SHOW_LABELS; $('#sw-labels').setAttribute('aria-pressed', String(SHOW_LABELS)); };
 
 // ---------------------------------------------------------------- hero inspector: one machine, its generated 3D model, its own orbit
 const hero = { renderer: null, scene: null, camera: null, controls: null, group: null, key: '' };
+function synthElement(id) {   // a segmented object that has no BIM element yet (still shown, selectable, inspectable)
+  const o = OBJ.byKey.get(id.slice(4)); if (!o) return null; const [L, Dd, Hh] = o.size;
+  return { id, kind: 'equipment', provenance: 'scanned', name: o.label, label: o.label, function: o.function, confidence: o.confidence, category: o.category,
+    object_key: o.key, mesh: o.mesh, size: o.size, pos: o.pos, yaw_deg: o.yaw_deg, color: o.color, ifc_class: 'IfcBuildingElementProxy',
+    pose: { pos: [o.pos[0], o.pos[1], 0], yaw: rad(o.yaw_deg ?? 0) }, boxes: [{ c: [0, 0, Hh / 2], s: [L, Dd, Hh] }] };
+}
+const heroEl = (id) => groups.get(id)?.el ?? (id?.startsWith('obj:') ? synthElement(id) : null);
+const isHeroId = (id) => !!id && isHero(heroEl(id));
 function openHero(id) {
-  const e = groups.get(id)?.el; if (!isHero(e)) return;
+  const e = heroEl(id); if (!isHero(e)) return;
+  if (heroTemp) { world.remove(heroTemp); heroTemp = null; }
+  if (!groups.has(id)) { heroTemp = buildElement(e).g; world.add(heroTemp); }
   HERO = id; setSelection([id]);
   document.body.classList.add('hero-open');
   if (!SEL.includes(id)) setSelection([id]);
   if (VIEW === 'model' && stage === 'explore') setView('cloud');
   if (cloudU) cloudU.uHide.value = labelIndexOf(id);
-  focusOn([id]); manual = false; camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = now();
+  flyTo(id);
   if (!hero.renderer) {
     hero.renderer = new THREE.WebGLRenderer({ canvas: $('#hero-gl'), antialias: true, alpha: true });
     hero.renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); hero.renderer.setClearColor(0, 0);
@@ -725,7 +788,7 @@ function openHero(id) {
   $('#hero-prompt').value = HERO_PROMPT;
 }
 function renderHero(fit = false) {
-  const e = groups.get(HERO)?.el; if (!e) return closeHero();
+  const e = heroEl(HERO); if (!e) return closeHero();
   const key = JSON.stringify(e.boxes) + (e.label ?? '');
   if (key !== hero.key) {
     hero.key = key;
@@ -734,17 +797,28 @@ function renderHero(fit = false) {
     hero.group = g; hero.scene.add(g);
     if (fit) {
       const box = new THREE.Box3().setFromObject(g), c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
-      hero.controls.target.copy(c); hero.camera.position.set(c.x + r * 1.9, c.y - r * 2.3, c.z + r * 1.3);
+      // start from the side the camera filmed (mean of the object's best-view camera positions, in the object's own frame)
+      let az = -Math.atan2(2.3, 1.9);
+      const ob = objOf(e) ?? (String(HERO).startsWith('obj:') ? OBJ.byKey.get(String(HERO).slice(4)) : null);
+      if (ob?.views?.length && meta?.cameras) {
+        let mx = 0, my = 0, k = 0; for (const i of ob.views) { const cm = meta.cameras[i]; if (cm) { mx += cm[0]; my += cm[1]; k++; } }
+        if (k) az = Math.atan2(my / k - (e.pos?.[1] ?? ob.pos[1]), mx / k - (e.pos?.[0] ?? ob.pos[0])) - rad(e.yaw_deg ?? ob.yaw_deg ?? 0);
+      }
+      const dd = r * 2.6;
+      hero.controls.target.copy(c); hero.camera.position.set(c.x + dd * Math.cos(az), c.y + dd * Math.sin(az), c.z + r * 1.1);
+      hero.controls.autoRotate = true;
     }
     const inf = infoOf(HERO);
     $('#hero-title').textContent = inf.label;
     $('#hero-fn').textContent = inf.fn ?? '';
     $('#hero-meta').innerHTML = `<span class="chip">${esc(inf.cat ?? '')}</span><span class="chip hero">generated 3D model</span>${inf.size ? `<span class="chip">${inf.size[0].toFixed(1)} × ${inf.size[1].toFixed(1)} × ${inf.size[2].toFixed(1)} m</span>` : ''}${inf.conf != null ? `<span class="chip">${Math.round(inf.conf * 100)} % label confidence</span>` : ''}`;
-    $('#hero-parts').innerHTML = inf.parts.length ? inf.parts.map((p) => `<li><i style="background:${esc(p.color ?? '#ff8a3d')}"></i>${esc(p.name)}<small>${p.shape ?? 'box'} · ${p.s.map((v) => v.toFixed(2)).join(' × ')} m</small></li>`).join('') : '<li class="empty">No added parts yet. Ask the agent below.</li>';
+    renderStills($('#hero'), objOf(e) ?? (String(HERO).startsWith('obj:') ? OBJ.byKey.get(String(HERO).slice(4)) : null));
+    $('#hero-parts').innerHTML = inf.parts.length ? inf.parts.map((p) => `<li><i style="background:${esc(p.color ?? '#ff8a3d')}"></i>${esc(p.name)}<small>${p.shape ?? 'box'} · ${p.s.map((v) => v.toFixed(2)).join(' × ')} m</small></li>`).join('') : (LIVE ? '<li class="empty">No added parts yet. Ask the agent below.</li>' : '<li class="empty">No added parts yet.</li>');
   }
 }
 function closeHero() {
   HERO = null; document.body.classList.remove('hero-open');
+  if (heroTemp) { world.remove(heroTemp); heroTemp = null; }
   if (cloudU) cloudU.uHide.value = 0; focus.goal = 0; renderInfo();
 }
 function heroTick() {
@@ -758,8 +832,9 @@ $('#hero-form').onsubmit = (ev) => { ev.preventDefault(); sendMessage($('#hero-p
 
 // ---------------------------------------------------------------- server I/O
 let S = null, REC = null;
+const recModelName = () => (typeof REC?.model === 'string' ? REC.model : typeof REC?.model_name === 'string' ? REC.model_name : typeof REC?.agent_model === 'string' ? REC.agent_model : '');
 async function getRecorded() {
-  if (!REC) REC = await (await fetch('recorded-session.json')).json();
+  if (!REC) REC = await (await fetch(new URL('recorded-run.json', import.meta.url))).json();
   return REC;
 }
 async function post(url, body) {
@@ -809,7 +884,7 @@ async function selfWrite(fn) {   // our own writes must not look like agent acti
 
 // ---------------------------------------------------------------- UI helpers
 let toastT = 0;
-function toast(t, bad = false) { const el = $('#toast'); el.textContent = t; el.className = 'toast on' + (bad ? ' bad' : ''); clearTimeout(toastT); toastT = setTimeout(() => (el.className = 'toast'), 3200); }
+function toast(t, bad = false) { const el = $('#toast'); el.textContent = t; el.className = 'toast on' + (bad ? ' bad' : ''); toastT = now() + 3200; }
 function caption(tag, t) {
   $('#vp-tag').textContent = tag;
   const s = $('#vp-caption span'); if (s.textContent === (t || '')) return;
@@ -824,6 +899,8 @@ function pills(v, root = document) {
   setPill(root.querySelector('#p-safety, .p-safety'), v?.safety_ok, v && !v.safety_ok && v.counts?.hold > 0);
   setPill(root.querySelector('#p-physics, .p-physics'), v?.physics_ok);
   setPill(root.querySelector('#p-wishes, .p-wishes'), v ? v.desires_ok : null, true);
+  const rv = root.querySelector('#p-review, .p-review');   // independent second-model review (validation.review_ok), when the server has it
+  if (rv) { if (v?.review_ok != null) rv.dataset.seen = '1'; rv.hidden = !rv.dataset.seen; setPill(rv, v?.review_ok ?? null, true); }
 }
 const liveSummary = (v) => {
   if (!v?.counts) return '';
@@ -847,14 +924,16 @@ function setStage(s, { push = true } = {}) {
   stage = s; stageAt = now(); document.body.dataset.stage = s;
   const i = STAGES.indexOf(s), N = STAGES.length;
   $$('#stage-nav a').forEach((a, j) => { a.dataset.n = '0' + (j + 1); if (j === i) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); a.classList.toggle('done', j < i); });
-  $('#title').innerHTML = `${COPY[s].title}<sup>0${i + 1}</sup>`; $('#lede').textContent = COPY[s].lede;
+  $('#title').innerHTML = `${COPY[s].title}<sup>0${i + 1}</sup>`; $('#lede').textContent = s === 'bim' && POINTS() ? 'Walls and slab fitted to the cloud; every machine found and labelled as its own set of points.'
+    : s === 'explore' && !OBJ.meshes.size ? 'Each point belongs to an object. Hover to see what it is; click to see it in the video.' : COPY[s].lede;
   for (const el of [$('#title'), $('#lede')]) { el.classList.remove('fresh'); void el.offsetWidth; el.classList.add('fresh'); }
   $('#pos').textContent = '0' + (i + 1); $('#pos-n').textContent = '0' + N;
   $('#btn-back').disabled = i === 0;
   $('#btn-next').textContent = i < N - 1 ? `${COPY[STAGES[i + 1]].nav} →` : 'Back to start ↺';
   if (push) history.replaceState(null, '', '#' + s);
-  if (HERO && s !== 'explore' && s !== 'design') closeHero();
-  if (s !== prevStage || s === 'explore') setView(s === 'explore' && !OBJ.labels ? 'model' : DEFAULT_VIEW[s] ?? 'model');
+  if (HERO && s !== 'explore') closeHero();
+  if (s !== prevStage || DEFAULT_VIEW[s]) setView(POINTS() ? (DEFAULT_VIEW[s] ? 'cloud' : 'model') : s === 'explore' && !OBJ.labels ? (LIVE ? 'cloud' : 'model') : DEFAULT_VIEW[s] ?? 'model');
+  if (s !== 'cloud') { video.removeAttribute('style'); $('#vp-note').removeAttribute('style'); }
   // scene layers
   if (cloud) { cloud.visible = s !== 'capture'; frustum.visible = pathLine.visible = s === 'cloud'; }
   world.visible = ['bim', 'explore', 'design', 'deliver'].includes(s); overlay.visible = s === 'design' || s === 'deliver';
@@ -864,14 +943,12 @@ function setStage(s, { push = true } = {}) {
   const base = baselineOf(S) ?? baselineOf(REC);
   if (base) frameModel(base); else if (cloudC) { sceneC.copy(cloudC); sceneR = cloudR; }
   clipCeiling.constant = ceiling - 0.2;
-  if (s === 'capture') { video.loop = true; video.playbackRate = 1; video.play().catch(() => {}); caption('', ''); renderCaptureFacts(); }
+  if (s === 'capture') { video.loop = true; video.playbackRate = 1; if (prevStage !== 'capture') video.currentTime = 0; playVideo(); caption('', ''); renderCaptureFacts(); }
   if (s === 'cloud') {
-    cloudRate = Math.max(1, vdur() / 14);
-    video.loop = false; video.currentTime = 0; video.playbackRate = Math.min(16, cloudRate); video.play().catch(() => {});
-    caption('LingBot-Map', meta ? 'Reconstructing the floor from the video' : 'No point cloud yet: run reconstruct_scan');
-    if (meta) $('#vp-note').textContent = `Precomputed: ${meta.inference_seconds ?? '?'} s of GPU inference on an ${GPU} · replayed in capture order`;
-    if (cloud) revealTo(0);
+    video.loop = false; caption('', '');
+    if (meta) $('#vp-note').textContent = LIVE ? `computed just now · ${meta.inference_seconds ?? '?'} s on an ${GPU}` : `precomputed · ${meta.inference_seconds ?? '?'} s on an ${GPU}`;
     if (base) setCloudPoses(base, false);
+    REC3.track = null; recSeek(0); recSpeed(REC3.speed); recPlay(true);
     renderCloudFacts(0, 0);
   }
   if (s === 'bim') {
@@ -880,9 +957,9 @@ function setStage(s, { push = true } = {}) {
     if (base) {
       const ax = Math.cos(cam.az + Math.PI / 2), ay = Math.sin(cam.az + Math.PI / 2), along = (e) => e.pose.pos[0] * ax + e.pose.pos[1] * ay;
       const RANK = { slab: 0, wall: 1, column: 2, door: 3, window: 3, opening: 3, equipment: 4 };
-      applyModel(base, { animate: true, stagger: 2600, cloudAnim: false, order: (a, b) => (RANK[a.kind] ?? 5) - (RANK[b.kind] ?? 5) || along(a) - along(b) });
+      applyModel(base, { animate: true, stagger: POINTS() ? 1400 : 2600, cloudAnim: false, order: (a, b) => (RANK[a.kind] ?? 5) - (RANK[b.kind] ?? 5) || along(a) - along(b) });
       groups.forEach((r) => (r.born += 700));
-      caption('fit_bim', 'Point cloud → as-built model');
+      caption('fit_bim', POINTS() ? 'Point cloud → walls, slab and segmented objects' : 'Point cloud → as-built model');
     } else caption('fit_bim', 'No as-built model yet: run fit_bim');
     renderBimFacts(base);
   }
@@ -890,12 +967,13 @@ function setStage(s, { push = true } = {}) {
     video.pause(); if (cloud) revealTo(1e9);
     const m = D.model && D.mode !== 'idle' ? D.model : base;
     if (m) applyModel(m, { flag: {}, cloudAnim: false });
-    caption('explore', OBJ.labels ? 'Hover any point · click a machine to open it' : 'Click any machine to see what it is');
+    caption('explore', OBJ.labels ? (OBJ.meshes.size ? 'Hover any point · click a machine to open it' : 'Hover any point · click an object to see it in the video') : LIVE ? 'No segmented objects · showing the raw point cloud' : 'Click any machine to see what it is');
     renderExplorePanel();
   }
-  if (s === 'design') { video.pause(); if (cloud) revealTo(1e9); enterDesign(); loadScenarioList(); }
+  if (s === 'design') { video.pause(); if (cloud) revealTo(1e9); enterDesign(); }
   if (s === 'deliver') { video.pause(); if (cloud) revealTo(1e9); enterDeliver(); }
   renderInfo(); renderMentions();
+  if (LIVE) renderWaiting();
   camStage();
 }
 const go = (d) => { const i = STAGES.indexOf(stage) + d; setStage(STAGES[(i + STAGES.length) % STAGES.length]); };
@@ -912,14 +990,15 @@ function renderCloudFacts(n, frame) {
   const done = n >= meta.n;
   $('#cloud-facts').innerHTML = fact(fmt(n), done ? 'coloured points' : 'points so far', done ? 'hl' : '')
     + fact(`${frame}<small>/ ${meta.frames}</small>`, 'frames fused')
-    + fact(`${meta.inference_seconds ?? '–'}<small>s</small>`, `inference on an ${GPU}<br>(precomputed)`)
+    + fact(`${meta.inference_seconds ?? '–'}<small>s</small>`, LIVE ? `LingBot-Map inference<br>on an ${GPU}, just now` : `inference on an ${GPU}<br>(precomputed)`)
     + fact(`${meta.extent_m?.[0] ?? '–'}<small>× ${meta.extent_m?.[1] ?? '–'} m</small>`, 'floor extent');
 }
 function renderBimFacts(m) {
+  if (m && LIVE && !Object.keys(m.elements ?? {}).length) m = null;
   if (!m) { $('#bim-facts').innerHTML = fact('–', 'no model yet'); $('#bim-fine').textContent = ''; return; }
   const c = count(m), sc = m.scan ?? {};
   $('#bim-facts').innerHTML = fact(c.wall ?? 0, 'walls') + fact((c.door ?? 0) + (c.window ?? 0), 'doors + windows')
-    + fact(c.equipment ?? 0, 'equipment, coloured<br>from the scan')
+    + (POINTS() ? fact(OBJ.list.length, 'objects segmented<br>and labelled') : fact(c.equipment ?? 0, 'equipment, coloured<br>from the scan'))
     + (sc.fit_p50_mm != null ? fact(`${Math.round(sc.fit_p50_mm)}<small>mm</small>`, `median fit to the scan<br>P95 ${Math.round(sc.fit_p95_mm)} mm`, 'hl') : '');
   $('#bim-fine').textContent = [sc.perimeter && `Perimeter ${sc.perimeter}.`, sc.scale_source && `Scale: ${sc.scale_source}.`].filter(Boolean).join(' ');
 }
@@ -927,10 +1006,10 @@ function renderExplorePanel() {
   if (!$('#ex-facts')) return;
   const heroes = OBJ.list.filter((o) => o.mesh && OBJ.meshes.has(o.mesh));
   $('#ex-facts').innerHTML = OBJ.list.length
-    ? fact(OBJ.list.length, 'objects segmented<br>in the point cloud') + (OBJ.labels ? fact(fmt(OBJ.labels.reduce((a, x) => a + (x > 0), 0)), 'points assigned<br>to an object') : '') + fact(heroes.length, 'with a generated<br>3D model', heroes.length ? 'hl' : '')
-    : fact('–', 'segmentation not available yet:<br>showing the fitted boxes');
+    ? fact(OBJ.list.length, 'objects segmented<br>in the point cloud') + (OBJ.labels ? fact(fmt(OBJ.labels.reduce((a, x) => a + (x > 0), 0)), 'points assigned<br>to an object') : '') + (heroes.length ? fact(heroes.length, 'with a generated<br>3D model', 'hl') : '')
+    : fact('–', LIVE && friendlyError(stageOf('objects')) ? esc(friendlyError(stageOf('objects'))) : LIVE ? 'objects not segmented yet' : 'segmentation not available yet:<br>showing the fitted boxes');
   $('#ex-hint').textContent = OBJ.labels ? 'Hover any point to light up the object it belongs to. Click to select, shift-click to add more.' : 'Hover or click any machine to see what it is. Shift-click to select more.';
-  $('#ex-heroes').innerHTML = heroes.map((o) => { const id = elementForObject(o); return id ? `<button class="hero-btn" data-id="${esc(id)}"><span class="chip hero">3D</span>${esc(o.label)}<b>→</b></button>` : ''; }).join('');
+  $('#ex-heroes').innerHTML = heroes.map((o) => { const id = elementForObject(o) ?? 'obj:' + o.key; return id ? `<button class="hero-btn" data-id="${esc(id)}"><span class="chip hero">3D</span>${esc(o.label)}<b>→</b></button>` : ''; }).join('');
   $$('#ex-heroes .hero-btn').forEach((b) => (b.onclick = () => openHero(b.dataset.id)));
   const sel = SEL.map(infoOf).filter(Boolean);
   $('#ex-sel').innerHTML = sel.length ? `<div class="mono-label">Selected</div><div class="mentions">${sel.map((x) => `<span class="mention">@${esc(shortName(x.label))}</span>`).join('')}</div>
@@ -940,7 +1019,7 @@ function renderExplorePanel() {
 
 // ---------------------------------------------------------------- mentions + suggestions (selection -> request)
 function renderMentions() {
-  const box = $('#mentions'), ids = SEL.filter((id) => !id.startsWith('obj:'));
+  const box = $('#mentions'), ids = SEL.slice();
   box.innerHTML = ids.map((id) => `<span class="mention" data-id="${esc(id)}">@${esc(shortName(infoOf(id)?.label ?? id))}<button aria-label="Remove">×</button></span>`).join('');
   $$('#mentions .mention button').forEach((b) => (b.onclick = () => setSelection(SEL.filter((x) => x !== b.parentElement.dataset.id))));
   const n = ids.length, one = n === 1 ? infoOf(ids[0]) : null;
@@ -1000,8 +1079,8 @@ function enterDesign() {
     if (base) applyModel(base, { animate: true, stagger: 600 });
     D.model = base; D.val = null; pills(null); egressKey = ''; overlay.clear();
     if (D.mode === 'idle') {
-      feedClear(''); $('#feed').dataset.empty = 'Send the brief, pick a pre-generated scenario, or replay the recorded session.';
-      caption('as-built', 'Ready for a brief');
+      feedClear(''); $('#feed').dataset.empty = LIVE ? 'Press Send: the brief goes to the agent connected to this server.' : 'Press Run to send the brief to the agent.';
+      caption('as-built', 'Ready for a brief'); $('#btn-send').textContent = LIVE ? 'Send to agent →' : 'Run design →'; $('#btn-send').disabled = false;
     }
   } else {
     applyModel(D.model, { flag: D.settled ? failFlags(D.val) : {}, cloudAnim: false }); pills(D.val); egressKey = ''; drawEgress(D.val);
@@ -1010,22 +1089,36 @@ function enterDesign() {
   D.busyUntil = Math.max(D.busyUntil, now() + 900);
 }
 
-async function startReplay({ liveOnly = false, label = null } = {}) {
-  if (D.mode === 'replay' && D.queue.length && !liveOnly) return;
-  const live = hasDesign(S);
-  if (liveOnly && !live) { goLive(); D.settled = false; if (stage !== 'design') setStage('design'); return; }
-  const st = live ? S : await getRecorded();
+let FOLLOW = null;
+async function getFollowups() {
+  if (!FOLLOW) { try { FOLLOW = await (await fetch(new URL('recorded-followups.json', import.meta.url))).json(); } catch { FOLLOW = {}; } }
+  return FOLLOW;
+}
+async function startFollowup(k) {      // a recorded follow-on request (re-plan / model edit), continuing from the finished run
+  const F = (await getFollowups())[k]; if (!F) return;
+  await startReplay({ st: F, request: F.request, select: F.selected, label: `recorded follow-on · ${F.title}`, keepFocus: k === 'model_edit' });
+  if (k === 'model_edit' && F.selected?.[0]) flyTo(F.selected[0]);   // close on the machine before its parts appear
+}
+async function startReplay({ label = null, st: given = null, request = null, select = null, keepFocus = false } = {}) {     // recorded runs, played locally (never a live agent)
+  const live = false, st = given ?? await getRecorded();
+  if ($('#followups')) $('#followups').hidden = true;
+  D.keepFocus = keepFocus;
   const bi = baselineIdx(st.history);
   D.mode = 'replay'; D.src = live ? 'live' : 'recorded'; D.srcState = st; if (HERO) closeHero(); setSelection([]);
-  D.queue = st.history.slice(bi + 1); D.evMs = clamp(26000 / Math.max(1, D.queue.length), 700, 1300);
+  D.queue = st.history.slice(bi + 1); D.evMs = clamp(26000 / Math.max(1, D.queue.length), 700, 1300) / (+PARAMS.get('pace') || 1);
   if (live) { D.liveShown = S.history.length; D.histSig = histSig(S); }
   D.feedT = st.history[bi]?.t ?? 0; D.settled = false; D.anim = null;
-  feedClear(label ?? (live ? `replay · project history · ${D.queue.length} steps` : `replay · recorded session · ${D.queue.length} steps`));
+  feedClear(label ?? `recorded run${recModelName() ? ' · ' + recModelName() : ''}`);
   if (stage !== 'design') setStage('design');
+  if (select?.length) setSelection(select, { info: false });
+  if (request) { $('#brief-text').value = request; feedAdd('you', request + (select?.length ? ' · ' + select.map((id) => '@' + shortName(infoOf(id)?.label ?? id)).join(' ') : '')); }
+  const brief = request ? null : st.messages?.[0]; if (brief) { D.seenMsg.add(brief.id); feedAdd('you', brief.text); $('#brief-text').value = brief.text; }
+  if (!request && st.requirements?.length) feedAdd('note', `Client wishes recorded: ${st.requirements.map((r) => r.text).join(' · ')}`, 'add_requirement');
+  $('#btn-send').textContent = 'Running…'; $('#btn-send').disabled = true;
   clearWorld(); applyModel(st.history[bi].model, { cloudAnim: false }); D.model = st.history[bi].model; D.val = null;
   pills(null); egressKey = ''; overlay.clear(); $('#signoff').hidden = true;
-  caption('replay', label ? 'Replaying how the agent got there' : live ? 'Replaying the agent session on this project' : 'Replaying the recorded session');
-  D.busyUntil = now() + 1100; $('#btn-skip').hidden = false;
+  caption('brief', 'Brief sent · the agent reads the floor and the client wishes');
+  D.busyUntil = now() + 1600; $('#btn-skip').hidden = false;
 }
 function skipReplay() {
   if (!D.queue.length) return;
@@ -1049,7 +1142,12 @@ function stepDesign(t) {
     const v = ev.validation, failing = ev.action === 'validate' && v && !(v.code_ok && v.safety_ok && v.physics_ok !== false);
     const flag = {}; for (const id of ev.focus ?? []) flag[id] = failing ? BAD : LIME;
     applyModel(ev.model, { animate: true, flag }); D.model = ev.model; D.val = v;
-    pills(v); drawEgress(v); if (!HERO) focusOn(ev.focus);
+    pills(v); drawEgress(v);
+    if (!HERO) {
+      if (ev.action === 'add_part' && ev.focus?.[0]) flyTo(ev.focus[0]);           // close-up as parts appear on the machine
+      else if (ev.action === 'validate' && focus.az != null) { /* keep the close-up while the check runs */ }
+      else { if (focus.az != null) focus = { ...focus, az: null, w: 0 }; focusOn(ev.focus); }
+    }
     caption(ev.actor === 'human' ? 'you' : ev.action, ev.caption); eventRow(ev);
     D.busyUntil = t + D.evMs + (ev.action === 'validate' ? 500 : 0) + (ev.action === 'move_element' ? 500 : 0);
     if (ev.animation?.frames?.length) {
@@ -1075,11 +1173,21 @@ function settle(quiet = false) {
     if (D.mode === 'replay') D.mode = 'live';
   } else applyModel(D.model, { flag: failFlags(st.validation) });
   const v = recorded ? st.validation : S.validation;
-  pills(v); drawEgress(v); if (!HERO) focus.goal = 0;
-  caption(recorded ? 'recorded' : `R${st.model.revision ?? 1}`, st.agent_note || liveSummary(v) || st.history.at(-1)?.caption || '');
-  showSignoff(st);
+  pills(v); drawEgress(v); if (!HERO && !D.keepFocus) { focus.goal = 0; }
+  if (recorded) { D.model = st.model; applyModel(st.model, { flag: failFlags(st.validation) }); }
+  const warn = v?.counts?.warn ?? 0;
+  caption('done', `${liveSummary(v) || 'Design complete'}${warn ? ` · ${warn} site action${warn > 1 ? 's' : ''}` : ''}`);
+  $('#btn-send').textContent = LIVE ? 'Send to agent →' : 'Replay run ↺'; $('#btn-send').disabled = false;
+  if (!LIVE && $('#followups')) getFollowups().then((F) => {
+    const box = $('#followups'), keys = Object.keys(F).filter((k) => !k.startsWith('_'));
+    if (!keys.length) return;
+    box.querySelector('.fu-row').innerHTML = keys.map((k) => `<button class="fu" data-k="${esc(k)}"><b>${esc(F[k].title)}</b><small>${esc(F[k].request)}</small></button>`).join('');
+    box.querySelectorAll('.fu').forEach((b) => (b.onclick = () => startFollowup(b.dataset.k)));
+    box.hidden = false;
+  });
 }
 function showSignoff(st) {
+  if (!LIVE) return;   // the deployed demo plays a recorded run: no live sign-off
   const q = st?.questions?.find((x) => x.answer == null && !D.answered[x.id]);
   const box = $('#signoff');
   if (!q || stage !== 'design') { box.hidden = true; box.dataset.id = ''; return; }
@@ -1107,8 +1215,12 @@ function showSignoff(st) {
 }
 
 async function sendMessage(text, ids = [], where = 'brief') {
+  if (!LIVE) return startReplay();   // deployed demo: never posts to the server; plays the recorded run
   text = (text ?? '').trim(); if (!text) return;
+  const shown = text, objs = ids.filter((id) => id?.startsWith('obj:')).map((id) => OBJ.byKey.get(id.slice(4))).filter(Boolean);
+  const labelsFor = ids.map((id) => '@' + shortName(infoOf(id)?.label ?? id));
   ids = ids.filter((id) => id && !id.startsWith('obj:'));
+  if (objs.length) text += ' [referenced scanned objects: ' + objs.map((o) => `${o.label} (${o.key}, centre x ${o.pos[0].toFixed(1)} y ${o.pos[1].toFixed(1)})`).join('; ') + ']';
   if (D.mode !== 'live') { if (D.mode === 'replay' && D.queue.length) skipReplay(); goLive(); }
   const btn = where === 'hero' ? $('#hero-send') : $('#btn-send'); btn.disabled = true;
   try {
@@ -1116,9 +1228,9 @@ async function sendMessage(text, ids = [], where = 'brief') {
     await selfWrite(() => post('/api/message', ids.length ? { text, selected: ids } : { text }));
     const m = [...S.messages].reverse().find((x) => x.text === text); if (m) { agent.sentId = m.id; D.seenMsg.add(m.id); }
     agent.briefAt = now();
-    feedAdd('you', text + (ids.length ? ' · ' + ids.map((id) => '@' + shortName(infoOf(id)?.label ?? id)).join(' ') : ''));
+    feedAdd('you', shown + (labelsFor.length ? ' · ' + labelsFor.join(' ') : ''));
     caption('request', 'Sent · waiting for the agent');
-    toast(ids.length ? `Sent with ${ids.length} referenced object${ids.length > 1 ? 's' : ''}` : 'Brief sent to the agent');
+    toast(labelsFor.length ? `Sent with ${labelsFor.length} referenced object${labelsFor.length > 1 ? 's' : ''}` : 'Brief sent to the agent');
     if (where === 'brief') { setSelection([]); $('#brief-text').value = text; }
   } catch (ex) { toast('Could not send: ' + ex.message, true); }
   finally { setTimeout(() => (btn.disabled = false), 1500); }
@@ -1134,7 +1246,9 @@ function onState(prev) {
     D.liveShown = S.history.length; D.histSig = histSig(S);
     if (!(D.mode === 'replay' && D.src === 'recorded')) {
       D.mode = 'idle'; D.queue = []; D.model = null; D.settled = true;
-      if (stage === 'design') enterDesign();
+      if (stage === 'design' && replaced && hasDesign(S)) startReplay({ liveOnly: true, label: 'scenario loaded · replaying how the agent got there' });
+      else if (stage === 'design') enterDesign();
+      else if (stage === 'explore') applyModel(S.model, { animate: true });
     }
   } else if (S.history.length > D.liveShown && !D.loading) {
     const fresh = S.history.slice(D.liveShown);
@@ -1142,13 +1256,14 @@ function onState(prev) {
     if (D.mode === 'live' || (D.mode === 'replay' && D.src === 'live')) { D.queue.push(...S.history.slice(D.liveShown)); D.liveShown = S.history.length; D.srcState = S; D.settled = false; }
   } else if (prev && prev.seq !== S.seq && D.mode === 'live' && !D.queue.length) D.settled = false;   // note / question / answer changed
   if (D.mode === 'live') D.srcState = S;
+  if (stage === 'explore' && prev && prev.seq !== S.seq && !replaced) applyModel(S.model, { animate: true });   // e.g. parts added to the open machine
   if (stage === 'deliver' && prev && prev.seq !== S.seq) renderDeliver(false);
 }
 
 function agentIndicator() {
   const t = now(), el = $('#agent-state'), openQ = S?.questions?.some((q) => q.answer == null);
   let cls = '', text = 'Agent idle';
-  const silentSinceBrief = agent.briefAt && agent.at < agent.briefAt && t - agent.briefAt > 10000;
+  const silentSinceBrief = agent.briefAt && agent.at < agent.briefAt && t - agent.briefAt > (LIVE ? 15000 : 10000);
   if (D.mode === 'replay' && D.queue.length) { cls = 'replay'; text = 'Replaying a session'; }
   else if (agent.at && t - agent.at < 12000) { cls = 'working'; text = 'Agent working'; }
   else if (silentSinceBrief) { cls = 'missing'; text = 'No agent detected'; }
@@ -1166,6 +1281,7 @@ async function loadScenarioList() {
   $$('#scen .scen').forEach((b) => (b.onclick = () => loadScenario(b.dataset.name, b)));
 }
 async function loadScenario(name, btn) {
+  return;   // deployed demo: recorded run only
   if (D.loading) return;
   D.loading = true; $$('#scen .scen').forEach((x) => (x.disabled = true)); btn.classList.add('busy');
   const sc = scenarios.find((s) => s.name === name);
@@ -1183,13 +1299,15 @@ async function loadScenario(name, btn) {
 
 // ---------------------------------------------------------------- 06 deliver
 let qtyCache = null;
-function deliverSource() { return D.src === 'recorded' && !hasDesign(S) && REC ? REC : S; }
+function deliverSource() { return LIVE ? S : REC; }
 function enterDeliver() {
   clearWorld(); renderDeliver(true);
-  const st = deliverSource();
-  $('#files').innerHTML = ''; $('#export-status').textContent = st === REC ? 'Showing the recorded session. Export writes the live project.' : '';
-  if (st === S) mcp('get_quantities').then((q) => { qtyCache = q; renderQty(); }).catch(() => { $('#qty').innerHTML = '<p class="fine">Quantities unavailable.</p>'; });
-  else { qtyCache = null; $('#qty').innerHTML = '<p class="fine">Quantities come from the live project (get_quantities).</p>'; }
+  const st = LIVE ? S : REC, v = st?.validation;
+  if (!st?.model) return;
+  $('#dl-reqs').innerHTML = (st.requirements ?? []).map((r) => `<li class="${r.status === 'met' ? 'ok' : ''}"><i></i>${esc(r.text)}<small>${esc(r.status)}</small></li>`).join('');
+  $('#dl-warn').innerHTML = (v?.issues ?? []).filter((i) => i.severity === 'warn').map((i) => `<li class="warn"><i></i>${esc(i.message.split(';')[0])}<small>${esc(i.fix ?? '')}</small></li>`).join('') || '<li class="ok"><i></i>None</li>';
+  const added = Object.values(st.model.elements).filter((e) => e.provenance === 'proposed' && e.kind !== 'space');
+  $('#dl-added').innerHTML = added.map((e) => `<li><i class="prop"></i>${esc(e.name)}<small>${esc(e.kind)}${(e.parts?.length) ? ' · ' + e.parts.map((q) => esc(q.name)).join(', ') : ''}</small></li>`).join('');
 }
 function renderDeliver(animate) {
   const st = deliverSource(); if (!st) return;
@@ -1197,8 +1315,8 @@ function renderDeliver(animate) {
   pills(st.validation); egressKey = ''; drawEgress(st.validation);
   const v = st.validation;
   caption(`R${st.model.revision ?? 1}`, liveSummary(v) || 'Current model');
-  $('#dl-checks').innerHTML = ['code', 'safety', 'physics', 'wishes'].map((k) => `<span class="pill p-${k}"><i></i>${k[0].toUpperCase() + k.slice(1)}</span>`).join('');
-  pills(v, $('#dl-checks'));
+  $('#dl-checks').innerHTML = ['code', 'safety', 'physics', 'wishes', 'review'].map((k) => `<span class="pill p-${k}"><i></i>${k[0].toUpperCase() + k.slice(1)}</span>`).join('');
+  pills(v, $('#dl-checks')); renderReview(v);
   $('#next').innerHTML = (st.next_steps ?? []).map((s) => `<li>${esc(s.title)}<small>${esc(s.who)}${s.why ? ' · ' + esc(s.why) : ''}</small></li>`).join('');
 }
 function renderQty() {
@@ -1211,6 +1329,7 @@ function renderQty() {
 const FILE_TAG = (f) => f.endsWith('.ifc') ? ['IFC', 'IFC4 BIM model'] : f.endsWith('.glb') ? ['GLB', '3D for any viewer'] : f.endsWith('.mjcf.xml') ? ['MJCF', 'MuJoCo physics scene']
   : f === 'validation.json' ? ['JSON', 'every check + scan fit'] : f === 'model.json' ? ['JSON', 'parametric model'] : f.endsWith('.md') ? ['MD', 'package readme'] : ['SHA', 'checksums'];
 async function doExport() {
+  return;   // deployed demo: no live export
   const b = $('#btn-export'); b.disabled = true; $('#export-status').textContent = 'Exporting… re-runs every check and the MuJoCo drop test';
   try {
     const r = await selfWrite(() => mcp('export_package'));
@@ -1224,20 +1343,400 @@ async function doExport() {
   finally { b.disabled = false; }
 }
 
+
+// ---------------------------------------------------------------- 02 reconstruct: three panes, all driven by the video clock
+// Video plays natively (never stepped per frame); the top-down reveal and the first-person view read video.currentTime.
+// First person = web/app.js follow mode: Catmull-Rom over meta.cameras [pos, forward, up], the video's horizontal FOV,
+// meta.frame_dt seconds per reconstruction frame, and only points from +-12 reconstruction frames around now.
+const REC3 = { speed: 2, playing: true, base: 0, at: 0, rects: null, track: null, win: 12,
+  top: new THREE.PerspectiveCamera(30, 1, 0.1, 500), fpv: new THREE.PerspectiveCamera(50, 1, 0.03, 200) };
+REC3.top.up.set(0, 0, 1);
+function frameDt() {
+  if (meta?.frame_dt) return meta.frame_dt;
+  const nominal = 1 / (meta?.fps || 2), d = video.duration;
+  if (meta && isFinite(d) && d > 0 && Math.abs(d / meta.frames - nominal) / nominal < 0.03) return d / meta.frames;
+  return nominal;
+}
+function videoT() { return CAPTURE ? Math.min(vdur(), REC3.base + (REC3.playing ? (vnow - REC3.at) / 1000 * REC3.speed : 0)) : video.currentTime; }
+function recPlay(on) {
+  if (CAPTURE) { REC3.base = videoT(); REC3.at = vnow; }
+  else { video.playbackRate = REC3.speed; if (on) { if (video.ended || video.currentTime >= vdur() - 0.05) video.currentTime = 0; playVideo(); } else video.pause(); }
+  REC3.playing = on; updateRecUI();
+}
+function recSeek(t) { if (CAPTURE) { REC3.base = t; REC3.at = vnow; } else video.currentTime = t; }
+function recSpeed(x) { if (CAPTURE) { REC3.base = videoT(); REC3.at = vnow; } REC3.speed = x; if (!CAPTURE) video.playbackRate = x; updateRecUI(); }
+function updateRecUI() {
+  $('#rec-play').textContent = REC3.playing ? 'Pause' : 'Play';
+  document.querySelectorAll('#rec-speed button').forEach((b) => b.setAttribute('aria-pressed', String(+b.dataset.x === REC3.speed)));
+}
+video.addEventListener('ended', () => { if (stage === 'cloud') { REC3.playing = false; updateRecUI(); } });
+$('#rec-play').onclick = () => recPlay(!REC3.playing);
+document.querySelectorAll('#rec-speed button').forEach((b) => (b.onclick = () => recSpeed(+b.dataset.x)));
+$('#rec-scrub').addEventListener('input', (e) => recSeek(+e.target.value * vdur()));
+function recRects() {
+  const pad = 12, gap = 12, asp = meta?.aspect ?? 16 / 9;
+  let pw = (W - 2 * pad - gap) / 2, ph = pw / asp;
+  if (ph > H * 0.5) { ph = H * 0.5; pw = ph * asp; }
+  const x0 = (W - (2 * pw + gap)) / 2, r = (x, y, w, h) => ({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+  return { video: r(x0, pad, pw, ph), fpv: r(x0 + pw + gap, pad, pw, ph), top: r(pad, pad + ph + gap, W - 2 * pad, H - ph - 2 * pad - gap) };
+}
+function placePanes(R) {
+  for (const [k, r] of Object.entries(R)) Object.assign($('#pane-' + k).style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+  Object.assign($('#vp-note').style, { top: (R.top.y + 10) + 'px', bottom: 'auto', right: (W - R.top.x - R.top.w + 10) + 'px' });
+  Object.assign(video.style, { left: R.video.x + 'px', top: R.video.y + 'px', width: R.video.w + 'px', height: R.video.h + 'px', bottom: 'auto' });
+}
+function buildTrack() {
+  return meta.cameras.map((c) => ({ p: new THREE.Vector3(c[0], c[1], c[2]), f: new THREE.Vector3(c[3], c[4], c[5]).normalize(),
+    u: c.length >= 9 ? new THREE.Vector3(c[6], c[7], c[8]).normalize() : new THREE.Vector3(0, 0, 1) }));
+}
+const crm = (a, b, c, d, t, out) => { const t2 = t * t, t3 = t2 * t;
+  return out.set(0, 0, 0).addScaledVector(a, -0.5 * t3 + t2 - 0.5 * t).addScaledVector(b, 1.5 * t3 - 2.5 * t2 + 1).addScaledVector(c, -1.5 * t3 + 2 * t2 + 0.5 * t).addScaledVector(d, 0.5 * t3 - 0.5 * t2); };
+const _fw = new THREE.Vector3(), _up = new THREE.Vector3(), _rt = new THREE.Vector3(), _bk = new THREE.Vector3(), _m4 = new THREE.Matrix4();
+function applyPose(cam, t) {
+  const T = REC3.track ??= buildTrack(), n = T.length; if (n < 2) return;
+  const f = clamp(t / frameDt(), 0, n - 1), i = Math.min(Math.floor(f), n - 2), k = f - i, g = (j) => T[clamp(j, 0, n - 1)];
+  crm(g(i - 1).p, g(i).p, g(i + 1).p, g(i + 2).p, k, cam.position);
+  crm(g(i - 1).f, g(i).f, g(i + 1).f, g(i + 2).f, k, _fw).normalize();
+  crm(g(i - 1).u, g(i).u, g(i + 1).u, g(i + 2).u, k, _up).normalize();
+  _rt.crossVectors(_fw, _up).normalize(); _up.crossVectors(_rt, _fw).normalize();
+  _m4.makeBasis(_rt, _up, _bk.copy(_fw).negate()); cam.quaternion.setFromRotationMatrix(_m4);
+}
+function topCamFit(r) {
+  const cam = REC3.top, ext = cloudPlan?.ext ?? meta.extent_m ?? [20, 12], el = 1.32, az = -Math.PI / 2, c = cloudPlan?.c ?? cloudC ?? sceneC;
+  cam.aspect = r.w / r.h; cam.updateProjectionMatrix();
+  const vf = rad(cam.fov) / 2, hf = Math.atan(Math.tan(vf) * cam.aspect);
+  const d = Math.max((ext[0] / 2) / Math.tan(hf), (ext[1] / 2 * Math.sin(el) + ceiling * Math.cos(el) / 2) / Math.tan(vf)) * 1.06;
+  cam.position.set(c.x + d * Math.cos(el) * Math.cos(az), c.y + d * Math.cos(el) * Math.sin(az), c.z + d * Math.sin(el)); cam.lookAt(c);
+}
+const pointSize = () => { const v = meta?.voxel_m ?? 0.02; return v < 0.02 ? v * 2.4 : v * 1.35; };
+function renderRecon(t) {
+  const R = REC3.rects = recRects(); placePanes(R);
+  const vt = videoT(), F = meta.frames, O = meta.frame_offsets, f = vt / frameDt();
+  const n = revealTo(Math.min(f, F));
+  const vox = pointSize();
+  renderer.setScissorTest(true);
+  renderer.setViewport(0, 0, W, H); renderer.setScissor(0, 0, W, H); renderer.clear();
+  const pane = (r) => { renderer.setViewport(r.x, H - r.y - r.h, r.w, r.h); renderer.setScissor(r.x, H - r.y - r.h, r.w, r.h); };
+  world.visible = false; overlay.visible = false; cloud.visible = true;
+  cloudU.uOpModel.value = cloudU.uOpScan.value = 1; cloudU.uSeg.value = 0; cloudU.uDim.value = 0; cloudU.uHover.value = 0; cloudU.uHide.value = 0;
+  // top-down: everything revealed so far, phone marker + trail
+  topCamFit(R.top); pane(R.top);
+  cloudU.uLo.value = 0; cloudU.uMinPx.value = 1.6; cloudU.uMaxPx.value = 24; cloudU.uRound.value = 1; cloudU.uSize.value = vox * 1.25;
+  cloudU.uScale.value = R.top.h * renderer.getPixelRatio() / 2 / Math.tan(rad(REC3.top.fov) / 2);
+  clipCeiling.constant = ceiling - 0.2; frustum.visible = pathLine.visible = true; if (grid) grid.visible = true;
+  frustum.scale.setScalar(1.6);
+  renderer.render(scene, REC3.top);
+  // first person: interpolated capture pose at the same video time, +-12 reconstruction frames of points
+  const cam = REC3.fpv; cam.aspect = R.fpv.w / R.fpv.h;
+  const th = Math.tan(rad(meta.fov_y_deg ?? 55) / 2) * (meta.aspect ?? 16 / 9);
+  cam.fov = THREE.MathUtils.radToDeg(2 * Math.atan(th / cam.aspect)); cam.near = 0.03; cam.updateProjectionMatrix();
+  applyPose(cam, Math.min(vt, (F - 1) * frameDt()));
+  const a = clamp(Math.floor(f - REC3.win), 0, F), b = clamp(Math.ceil(f + REC3.win) + 1, 0, F);
+  cloudU.uLo.value = O[a]; cloudU.uReveal.value = O[b] ?? meta.n; cloudU.uFresh.value = 1; cloud.geometry.setDrawRange(0, meta.n);
+  cloudU.uMaxPx.value = 13; cloudU.uRound.value = 0; cloudU.uSize.value = vox * 1.1;
+  cloudU.uScale.value = R.fpv.h * renderer.getPixelRatio() / 2 / Math.tan(rad(cam.fov) / 2);
+  clipCeiling.constant = 1e6; frustum.visible = pathLine.visible = false; if (grid) grid.visible = false;
+  pane(R.fpv); renderer.render(scene, cam);
+  renderer.setScissorTest(false); renderer.setViewport(0, 0, W, H);
+  cloudU.uLo.value = 0; cloudU.uRound.value = 1; cloudU.uMaxPx.value = 64; frustum.scale.setScalar(1); if (grid) grid.visible = true;
+  revealTo(Math.min(f, F));
+  if (((t / 120) | 0) !== renderRecon.last) {
+    renderRecon.last = (t / 120) | 0;
+    renderCloudFacts(n, Math.min(F, Math.floor(f) + 1));
+    $('#rec-time').textContent = `${mmss(vt)} / ${mmss(vdur())}`;
+    if (document.activeElement !== $('#rec-scrub')) $('#rec-scrub').value = String(vt / vdur());
+  }
+}
+
+// ---------------------------------------------------------------- watch for the segmented scan / a denser cloud / a hero model
+let scanSig = null;
+async function scanSignature() {
+  try {
+    const m = await (await fetch('/data/scan/meta.json', { cache: 'no-store' })).text();
+    const o = await fetch('/data/scan/objects.json', { cache: 'no-store' });
+    return m.length + ':' + JSON.parse(m).n + ':' + (o.ok ? (await o.text()) : '').length;
+  } catch { return scanSig; }
+}
+async function watchScan() {
+  const sig = await scanSignature();
+  if (scanSig && sig && sig !== scanSig) {
+    scanSig = sig;
+    toast('New scan data: reloading the point cloud');
+    const nOld = meta?.n;
+    const m2 = await (await fetch('/data/scan/meta.json', { cache: 'no-store' })).json();
+    if (m2.n !== nOld) {
+      if (cloud) { scene.remove(cloud); pickScene.remove(pickPoints); cloud.geometry.dispose(); cloud = null; pickPoints = null; }
+      await loadCloud();
+    } else meta = m2;
+    Object.assign(OBJ, { list: [], byKey: new Map(), byIndex: new Map(), meshes: new Map(), labels: null, maxIndex: 0 });
+    MOVE.cur = new Map(); MOVE.to = null;
+    await loadObjects();
+    clearWorld(); setSelection([]); if (HERO) closeHero();
+    setStage(stage, { push: false });
+  } else if (!scanSig) scanSig = sig;
+  setTimeout(watchScan, 20000);
+}
+
+// ---------------------------------------------------------------- independent review (validation.review from the Gemini Decisions API)
+function renderReview(v) {
+  const box = $('#review'); const r = v?.review;
+  if (!r || !r.answers || !Object.keys(r.answers).length) { box.hidden = true; return; }
+  box.hidden = false;
+  const rows = Object.entries(r.answers).slice(0, 6).map(([k, a]) => {
+    const p = a.p_yes != null ? a.p_yes : a.score != null && a.of ? a.score / a.of : null;
+    const val = a.p_yes != null ? `${Math.round(a.p_yes * 100)} % yes` : a.score != null ? `${a.score} / ${a.of}` : '';
+    return `<div class="rv-row"><span>${esc(a.about || a.rule || k)}</span><i><b style="width:${p == null ? 0 : Math.round(p * 100)}%"></b></i><small>${esc(val)}</small></div>`;
+  }).join('');
+  box.innerHTML = `<div class="mono-label">Independent review · ${esc(r.model ?? 'second model')} · closed questions, calibrated probabilities</div>${rows}`;
+}
+
+// ---------------------------------------------------------------- fly to an object from the side it was scanned from
+let heroTemp = null, segTouched = false;
+function flyTo(id) {
+  const inf = infoOf(id); if (!inf) return;
+  let c, r;
+  const rec = groups.get(id);
+  if (rec) { const b = elementBox(rec.el); c = b.getCenter(new THREE.Vector3()); r = b.getSize(new THREE.Vector3()).length() / 2; }
+  else if (inf.o) { const o = inf.o; c = new THREE.Vector3(o.pos[0], o.pos[1], (o.size?.[2] ?? 1.5) / 2); r = Math.hypot(...(o.size ?? [2, 2, 2])) / 2; }
+  else return;
+  const o = inf.o ?? objOf(inf.e);
+  let dir = new THREE.Vector2(c.x - sceneC.x, c.y - sceneC.y).multiplyScalar(-1);
+  if (o?.views?.length && meta?.cameras) {
+    const m = new THREE.Vector2(); let k = 0;
+    for (const i of o.views) { const cm = meta.cameras[i]; if (cm) { m.x += cm[0]; m.y += cm[1]; k++; } }
+    if (k) dir = m.divideScalar(k).sub(new THREE.Vector2(c.x, c.y));
+  }
+  if (dir.lengthSq() < 1e-6) dir.set(0, -1);
+  focus = { c: new THREE.Vector3(c.x, c.y, Math.min(c.z, 1.2)), w: focus.w ?? 0, goal: 1, r, az: Math.atan2(dir.y, dir.x), el: 0.42, dist: Math.max(4.5, r * 3.2) };
+  manual = false; camFrom = { target: cam.target.clone(), az: cam.az, el: cam.el, dist: cam.dist }; camAt = now();
+}
+
+
+// ---------------------------------------------------------------- object stills from the actual video
+// Each object lists `views` (reconstruction frames where it is best seen). Frame i is at i * frame_dt s in the video.
+// A hidden <video> seeks there and the object's bbox is projected through that frame's camera (meta.cameras pose,
+// fov_y_deg, aspect) to crop around it; the labelling montage (objects_preview/<key>.jpg) shows while frames decode.
+const stills = { vid: null, cache: new Map(), queue: Promise.resolve() };
+function stillVideo() {
+  if (stills.vid) return stills.vid;
+  const v = document.createElement('video'); v.muted = true; v.preload = 'auto'; v.playsInline = true;
+  v.src = video.currentSrc || video.src; stills.vid = v; return v;
+}
+function projectBox(o, frame, vw, vh) {   // object bbox -> pixel rect in that video frame (null if not in front)
+  const c = meta?.cameras?.[frame]; if (!c || !o.bbox_min || !o.bbox_max) return null;
+  const C = new THREE.Vector3(c[0], c[1], c[2]), f = new THREE.Vector3(c[3], c[4], c[5]).normalize();
+  let u = c.length >= 9 ? new THREE.Vector3(c[6], c[7], c[8]).normalize() : new THREE.Vector3(0, 0, 1);
+  const r = new THREE.Vector3().crossVectors(f, u).normalize(); u = new THREE.Vector3().crossVectors(r, f).normalize();
+  const A = meta.aspect ?? vw / vh;   // the reconstruction frame is the centred crop of the video with this aspect
+  const cw = vw / vh > A ? vh * A : vw, chh = vw / vh > A ? vh : vw / A, ox = (vw - cw) / 2, oy = (vh - chh) / 2;
+  const ty = Math.tan(rad(meta.fov_y_deg ?? 55) / 2), tx = ty * A;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, front = 0;
+  for (const X of [o.bbox_min[0], o.bbox_max[0]]) for (const Y of [o.bbox_min[1], o.bbox_max[1]]) for (const Z of [o.bbox_min[2], o.bbox_max[2]]) {
+    const d = new THREE.Vector3(X, Y, Z).sub(C), z = d.dot(f); if (z < 0.1) continue; front++;
+    const px = ox + (d.dot(r) / (z * tx) + 1) / 2 * cw, py = oy + (1 - d.dot(u) / (z * ty)) / 2 * chh;
+    x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+  }
+  if (front < 4) return null;
+  const pw = (x1 - x0) * 0.18 + 24, ph = (y1 - y0) * 0.18 + 24;
+  x0 = clamp(x0 - pw, 0, vw); x1 = clamp(x1 + pw, 0, vw); y0 = clamp(y0 - ph, 0, vh); y1 = clamp(y1 + ph, 0, vh);
+  if (x1 - x0 < 40 || y1 - y0 < 40) return null;
+  return [x0, y0, x1 - x0, y1 - y0];
+}
+function grabStill(o, frame) {   // -> {url, t, cropped}; frames are decoded one at a time
+  const key = o.key + ':' + frame;
+  if (stills.cache.has(key)) return stills.cache.get(key);
+  const p = stills.queue = stills.queue.then(() => new Promise((res) => {
+    const v = stillVideo(), t = Math.min(frame * frameDt(), Math.max(0, vdur() - 0.05));
+    const draw = () => {
+      const vw = v.videoWidth, vh = v.videoHeight; if (!vw) return res(null);
+      const box = projectBox(o, frame, vw, vh) ?? [0, 0, vw, vh];
+      const out = 520, s = out / Math.max(box[2], box[3]), cv = document.createElement('canvas');
+      cv.width = Math.round(box[2] * s); cv.height = Math.round(box[3] * s);
+      cv.getContext('2d').drawImage(v, box[0], box[1], box[2], box[3], 0, 0, cv.width, cv.height);
+      res({ url: cv.toDataURL('image/jpeg', 0.86), t, cropped: box[2] < vw });
+    };
+    const seek = () => { const done = () => { v.removeEventListener('seeked', done); clearTimeout(to); draw(); }; const to = setTimeout(done, 4000); v.addEventListener('seeked', done); v.currentTime = t; };
+    if (v.readyState >= 1) seek(); else { v.addEventListener('loadedmetadata', seek, { once: true }); setTimeout(() => res(null), 8000); }
+  }));
+  stills.cache.set(key, p); return p;
+}
+function renderStills(box, o) {
+  const host = box.querySelector('.stills'); if (!host || !o) return;
+  const views = (o.views ?? []).slice(0, 3);
+  host.innerHTML = `<div class="stills-row n${views.length}">${views.map((f, i) => `<button class="still" data-f="${f}" title="From the video at ${mmss(f * frameDt())}: show this moment"><img alt=""><small>${i ? '' : 'From the video · '}${mmss(f * frameDt())}</small></button>`).join('')}</div><img class="montage" alt="" src="${dataURL('/data/scan/objects_preview/' + encodeURIComponent(o.key) + '.jpg')}">`;
+  const montage = host.querySelector('.montage');
+  montage.onerror = () => montage.remove();
+  if (!views.length) return;
+  let shown = 0;
+  host.querySelectorAll('.still').forEach((b) => {
+    const f = +b.dataset.f;
+    b.onclick = () => jumpToMoment(f * frameDt());
+    grabStill(o, f).then((r) => {
+      if (!r || !b.isConnected) { b.remove(); return; }
+      b.querySelector('img').src = r.url; b.classList.add('ready'); shown++;
+      if (shown === 1) host.classList.add('has-stills');
+    });
+  });
+}
+function jumpToMoment(t) {   // show that moment in the synced three-pane view
+  if (stage !== 'cloud') setStage('cloud');
+  recSeek(t); recPlay(false);
+}
+
+
+// ---------------------------------------------------------------- LIVE mode (live.html): upload a video, follow the real pipeline
+// GET /api/job drives everything: each product (video, cloud, objects, model) is loaded the moment its stage is done,
+// with the job start time as a cache-buster. Failed stages are shown as failed; nothing is filled in or replayed.
+const LV = { job: null, started: null, have: {}, auto: true, showDrop: false, uploading: false, pollTimer: null };
+const PIPE = [['video', 'Video'], ['reconstruct', 'Reconstruct'], ['cloud', 'Dense cloud'], ['objects', 'Objects'], ['model', 'As-built model']];
+const NEEDS = { capture: ['video'], cloud: ['reconstruct', 'cloud'], bim: ['model'], explore: ['cloud'], design: ['model'], deliver: ['model'] };
+const PRODUCT_STAGE = { video: 'capture', cloud: 'cloud', objects: 'explore', model: 'bim' };
+const emptyState = () => ({ seq: -1, history: [], messages: [], questions: [], requirements: [], next_steps: [], validation: null, agent_note: '', stage: 'scan',
+  model: { elements: {}, level: { ceiling_height: 2.8 } } });
+const stageOf = (k) => LV.job?.stages?.find((x) => x.key === k);
+function stageStatus(st) {      // pending | running | done | failed | stopped (job ended while this stage was 'running') | skipped
+  if (!st) return 'pending';
+  if (st.state === 'running' && LV.job?.state !== 'running') return 'stopped';
+  if (st.state === 'pending' && LV.job && LV.job.state !== 'running' && LV.job.state !== 'idle') return 'skipped';
+  return st.state;
+}
+function friendlyError(st) {
+  const e = String(st?.error ?? '');
+  if (st?.key === 'objects' && /401|api key|API_KEY|unauthori|permission/i.test(e + (LV.job?.log ?? []).join(' '))) return 'Object segmentation unavailable: no detector available';
+  if (st?.key === 'objects' && stageStatus(st) === 'stopped') return 'Object segmentation did not finish (stopped)';
+  return e ? e.replace(/^\w+Error: /, '').slice(0, 90) : stageStatus(st) === 'stopped' ? 'stopped before finishing' : '';
+}
+function stageNumbers(st) {
+  if (!st) return '';
+  switch (st.key) {
+    case 'video': return st.width ? `${st.width}×${st.height} · ${mmss(st.duration ?? 0)}` : '';
+    case 'reconstruct': { const m = /(\d+) frames in ([\d.]+)s/.exec(st.detail ?? ''); return m ? `${m[1]} frames · ${Math.round(+m[2])} s GPU` : ''; }
+    case 'cloud': return st.points ? `${fmt(st.points)} points` : '';
+    case 'objects': { const n = Array.isArray(st.objects) ? st.objects.length : st.objects; return n != null ? `${n} objects` : ''; }
+    case 'model': return st.counts ? [st.counts.wall && `${st.counts.wall} walls`, st.counts.equipment && `${st.counts.equipment} equipment`].filter(Boolean).join(' · ') : '';
+  }
+  return '';
+}
+const stageClock = (st) => (st?.seconds != null ? `${Math.round(st.seconds)} s` : st?.started ? mmss(Date.now() / 1000 - st.started) : '');
+function renderRail() {
+  const rail = $('#rail'); if (!rail) return;
+  rail.innerHTML = PIPE.map(([k, title]) => {
+    const st = stageOf(k), ss = stageStatus(st), err = ss === 'failed' || ss === 'stopped' ? friendlyError(st) : '';
+    const sub = err || (ss === 'running' ? `running · ${stageClock(st)}` : ss === 'done' ? [stageNumbers(st), stageClock(st)].filter(Boolean).join(' · ') : ss === 'skipped' ? 'not run' : 'waiting');
+    return `<span class="rs ${ss}" title="${esc(st?.title ?? title)}${err ? ': ' + esc(st?.error ?? '') : ''}"><i></i><b>${esc(title)}</b><small>${esc(sub)}</small></span>`;
+  }).join('');
+  const j = LV.job, tag = $('#live-tag');
+  if (tag) {
+    const total = j?.started ? (j.state === 'running' ? Date.now() / 1000 - j.started : j.seconds ?? 0) : 0;
+    const wide = innerWidth > 1700;
+    tag.querySelector('span').textContent = !j?.started ? 'LIVE · no video yet' : j.state === 'running' ? `LIVE · computing${wide ? ' now' : ''} · ${mmss(total)}` : `LIVE · ${wide ? 'computed just now · ' : ''}${mmss(total)} total`;
+    tag.className = 'live-tag ' + (j?.state === 'running' ? 'running' : '');
+  }
+}
+function renderWaiting() {      // the current step's data is not there yet: say exactly which stage it waits on
+  const w = $('#waiting'), drop = $('#drop'); if (!w) return;
+  $('#btn-send').disabled = !LV.have.model || (D.mode === 'replay' && D.queue.length > 0);
+  const showDrop = stage === 'capture' && (LV.showDrop || LV.uploading || !LV.have.video);
+  drop.hidden = !showDrop;
+  const need = (NEEDS[stage] ?? []).filter((k) => !LV.have[k === 'reconstruct' ? 'cloud' : k]);
+  if (showDrop || !need.length) { w.hidden = true; document.body.classList.remove('waiting-data'); return; }
+  const k = need.find((x) => ['running', 'failed', 'stopped'].includes(stageStatus(stageOf(x)))) ?? need[0], st = stageOf(k), ss = stageStatus(st);
+  const title = { reconstruct: 'LingBot-Map reconstruction', cloud: 'Dense point cloud', model: 'As-built model', video: 'Video', objects: 'Object segmentation' }[k] ?? st?.title;
+  const missing = st?.state === 'done' && LV.missAt?.[k === 'reconstruct' ? 'cloud' : k];
+  w.hidden = false; document.body.classList.add('waiting-data');
+  w.className = 'waiting ' + ss;
+  w.querySelector('h3').textContent = missing ? `${title}: files not found` : ss === 'running' ? `${title}…` : ss === 'failed' || ss === 'stopped' ? `${title}: failed` : `Waiting for: ${title}`;
+  w.querySelector('p').textContent = missing ? 'The stage reports done but its products are not on the server (were they replaced by a newer upload?). Retrying.' : ss === 'running' ? `running for ${stageClock(st)} on this machine` : ss === 'failed' || ss === 'stopped' ? friendlyError(st) || 'see the pipeline log'
+    : !LV.job?.started ? 'Upload a video in step 01 to start.' : ss === 'skipped' ? 'This stage did not run: an earlier stage failed.' : 'Queued: it starts when the stages before it finish.';
+}
+function resetLive() {
+  LV.have = {}; closeHero(); setSelection([]);
+  if (cloud) { scene.remove(cloud); pickScene.remove(pickPoints); cloud.geometry.dispose(); cloud = null; pickPoints = null; }
+  meta = null; cloudPlan = null; REC3.track = null;
+  Object.assign(OBJ, { list: [], byKey: new Map(), byIndex: new Map(), meshes: new Map(), labels: null, maxIndex: 0 });
+  MOVE.cur = new Map(); MOVE.to = null; stills.cache.clear(); stills.vid = null;
+  S = emptyState(); D.mode = 'idle'; D.queue = []; D.model = null; D.liveShown = null; D.histSig = null; clearWorld();
+  video.removeAttribute('src'); video.load();
+}
+async function loadProduct(k) {
+  if (k === 'video') { video.src = dataURL('/data/site.mp4'); video.load(); stills.vid = null; stills.cache.clear(); if (stage === 'capture') playVideo(); $('#thumbs').innerHTML = ''; grabThumbs(); }
+  if (k === 'cloud') {
+    if (cloud) { scene.remove(cloud); pickScene.remove(pickPoints); cloud.geometry.dispose(); cloud = null; pickPoints = null; }
+    meta = null; REC3.track = null; await loadCloud(); if (!meta) return false;
+  }
+  if (k === 'objects') { Object.assign(OBJ, { list: [], byKey: new Map(), byIndex: new Map(), meshes: new Map(), labels: null, maxIndex: 0 }); await loadObjects(); if (!OBJ.list.length) return false; }
+  if (k === 'model') { await poll(true); if (!Object.keys(S?.model?.elements ?? {}).length) return false; }
+  LV.have[k] = true; return true;
+}
+async function liveTick(initial = false) {
+  let job;
+  try { job = await (await fetch('/api/job', { cache: 'no-store' })).json(); } catch { return; }
+  if (LV.started !== null && job.started && job.started !== LV.started) {      // a new upload replaced the project
+    resetLive(); LV.started = job.started; BUST = String(Math.round(job.started)); LV.showDrop = false;
+    toast('New video received · the pipeline is running'); setStage('capture');
+  }
+  LV.job = job; if (LV.started === null) { LV.started = job.started ?? 0; BUST = job.started ? String(Math.round(job.started)) : ''; }
+  const landed = [];
+  for (const k of ['video', 'cloud', 'objects', 'model']) {
+    const st = stageOf(k), ready = !!st && st.state === 'done' && Date.now() - (LV.missAt?.[k] ?? 0) > 15000;
+    if (ready && !LV.have[k] && !LV['loading_' + k]) {
+      LV['loading_' + k] = true;
+      try { if (await loadProduct(k)) { landed.push(k); delete (LV.missAt ??= {})[k]; } else (LV.missAt ??= {})[k] = Date.now(); } finally { LV['loading_' + k] = false; }
+    }
+  }
+  if (landed.length && !initial) {
+    const target = PRODUCT_STAGE[landed.at(-1)];
+    if (LV.auto && target) setStage(target);
+    else if (landed.some((k) => (NEEDS[stage] ?? []).includes(k) || (stage === 'explore' && k === 'objects'))) setStage(stage, { push: false });
+    toast(`${PIPE.find((p) => p[0] === landed.at(-1))?.[1] ?? landed.at(-1)} ready`);
+  }
+  renderRail(); renderWaiting();
+  if (stage === 'explore') renderExplorePanel();
+}
+function uploadVideo(file) {
+  if (!file || LV.uploading) return;
+  if (LV.job?.state === 'running') { toast('A pipeline run is already in progress', true); return; }
+  LV.uploading = true; renderWaiting();
+  const bar = $('#drop-bar b'), msg = $('#drop-msg');
+  const title = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Uploaded site';
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', `/api/upload?name=${encodeURIComponent(file.name)}&title=${encodeURIComponent(title)}&site_type=factory`);
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) { bar.style.width = (100 * e.loaded / e.total).toFixed(1) + '%'; msg.textContent = `Uploading ${file.name} · ${Math.round(100 * e.loaded / e.total)} %`; } };
+  xhr.onload = () => {
+    LV.uploading = false;
+    if (xhr.status === 200) { msg.textContent = 'Uploaded · the pipeline is starting'; LV.showDrop = false; liveTick(); }
+    else { let e = xhr.responseText; try { e = JSON.parse(e).error; } catch { /* text */ } msg.textContent = `Upload refused (${xhr.status}): ${e}`; toast('Upload refused', true); }
+    renderWaiting();
+  };
+  xhr.onerror = () => { LV.uploading = false; msg.textContent = 'Upload failed: network error'; renderWaiting(); };
+  xhr.send(file);
+}
+async function liveBoot() {
+  S = emptyState();
+  $('#hint-cmd').textContent = `Opus 5.5 over the MCP server · ${location.origin}/mcp`;
+  const inp = $('#drop-file'), zone = $('#drop');
+  inp.onchange = () => uploadVideo(inp.files[0]);
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+  zone.addEventListener('drop', (e) => { e.preventDefault(); zone.classList.remove('over'); uploadVideo(e.dataTransfer.files[0]); });
+  $('#btn-upload').onclick = () => { LV.showDrop = true; setStage('capture'); renderWaiting(); };
+  $('#drop-cancel').onclick = () => { LV.showDrop = false; renderWaiting(); };
+  $('#btn-auto').onclick = () => { LV.auto = !LV.auto; $('#btn-auto').setAttribute('aria-pressed', String(LV.auto)); $('#btn-auto').title = LV.auto ? 'Steps advance as data lands (click to stop)' : 'Auto-advance is off'; };
+  video.addEventListener('loadedmetadata', () => document.body.classList.toggle('portrait', video.videoHeight > video.videoWidth));
+  await liveTick(true);
+  setInterval(liveTick, 1000);
+  setInterval(poll, 1000);
+}
+
 // ---------------------------------------------------------------- per-frame animation
 function animateStage(t) {
   const st = t - stageAt;
   stepCloudPoses(t);
-  if (stage === 'cloud' && meta) {
-    const vt = Math.min(vdur(), st / 1000 * cloudRate), n = revealTo(vt / vdur() * meta.frames * 1.0001);
-    if (!video.paused && Math.abs(video.currentTime - vt) > 0.5) video.currentTime = vt;
-    if (n >= meta.n && !revealDoneAt) { revealDoneAt = t; caption('LingBot-Map', 'Coloured point cloud · gravity-aligned, metric'); }
-    const fr = revealDoneAt ? 1 - span(t - revealDoneAt, 300, 1300) : 1;
-    frustum.scale.setScalar(Math.max(0.001, fr)); frustum.visible = fr > 0.01;
-    if (((t / 120) | 0) !== animateStage.last) { animateStage.last = (t / 120) | 0; renderCloudFacts(n, Math.min(meta.frames, Math.floor(vt * meta.fps) + 1)); }
-    cloudU.uOpModel.value = cloudU.uOpScan.value = 1; cloudU.uSeg.value = 0;
-  }
-  if (stage === 'bim') {
+  if (stage === 'bim' && POINTS()) {
+    applyViewLayers(st);
+    if (cloudU && VIEW === 'cloud' && !segTouched) cloudU.uSeg.value = st > 3600 ? 1 : 0;
+    if (st > 3600 && !animateStage.segCap) { animateStage.segCap = true; caption('segmented', `${OBJ.list.length} objects found in the cloud · segmented and labelled`); }
+  } else if (stage === 'bim') {
     if (cloudU) { cloudU.uOpModel.value = 1 - 0.8 * ease(span(st, 900, 3800)); cloudU.uOpScan.value = 1; cloudU.uReveal.value = meta.n; cloudU.uFresh.value = 1; cloudU.uSeg.value = 0; }
     if (!wipeUser) {
       let w = null;
@@ -1256,10 +1755,20 @@ function animateStage(t) {
     for (const [id, p] of Object.entries(f)) { const r = groups.get(id); if (r) { r.group.position.set(p[0], p[1], p[2]); r.group.quaternion.set(p[4], p[5], p[6], p[3]); } }
   }
 }
-function applyViewLayers(st) {   // cloud / blend / model
-  const cloudView = VIEW === 'cloud', blend = VIEW === 'blend';
+const SHELL = new Set(['wall', 'door', 'window', 'column', 'opening']);
+function setGhost(r, on) {     // shell as light geometry over the points
+  if (!!r.ghost === on) return; r.ghost = on;
+  r.group.traverse((o) => {
+    const m = o.material; if (!m?.isMaterial) return; const u = o.userData;
+    if (!u.g0) u.g0 = { op: m.opacity, tr: m.transparent, dw: m.depthWrite };
+    if (on) { m.transparent = true; m.opacity = o.isLineSegments ? 0.55 : 0.14; m.depthWrite = false; } else { m.transparent = u.g0.tr; m.opacity = u.g0.op; m.depthWrite = u.g0.dw; }
+    m.needsUpdate = true;
+  });
+}
+function applyViewLayers(st) {   // cloud (points) / blend / model (boxes)
+  const cloudView = VIEW === 'cloud', blend = VIEW === 'blend', pts = POINTS();
   const k = ease(span(st, 200, 1600));
-  cutNow = cloudView ? Infinity : k >= 1 ? CUT : (ceiling + 0.5) + (CUT - ceiling - 0.5) * k;
+  cutNow = cloudView ? (pts ? CUT : Infinity) : k >= 1 ? CUT : (ceiling + 0.5) + (CUT - ceiling - 0.5) * k;
   clipCeiling.constant = cloudView ? ceiling - 0.2 : blend ? Math.max(CUT_TALL, 0.3) + 0.3 : Math.max(cutNow, 0.3) + 0.02;
   if (cloudU) {
     const op = cloudView ? 1 : blend ? 0.6 : 1 - 0.88 * ease(span(st, 0, 1200));
@@ -1267,9 +1776,19 @@ function applyViewLayers(st) {   // cloud / blend / model
     cloudU.uDim.value = HOVER && cloudView && labelIndexOf(HOVER) ? 1 : 0;
   }
   if (cloud) cloud.visible = true;
-  for (const r of groups.values()) r.group.visible = !cloudView || r.el.id === HERO || (!OBJ.labels && SEL.includes(r.el.id));
-  overlay.visible = !cloudView && (stage === 'design' || stage === 'deliver');
-  $('#labels').style.visibility = cloudView ? 'hidden' : '';
+  for (const r of groups.values()) {
+    const e = r.el, shell = SHELL.has(e.kind);
+    r.group.visible = !cloudView || e.id === HERO || e.provenance === 'proposed' || (e.boxes ?? []).some((b) => b.part) || (pts ? shell : (!OBJ.labels && SEL.includes(e.id)));
+    if (shell) setGhost(r, cloudView && pts);
+  }
+  if (heroTemp) heroTemp.visible = true;
+  if (cloudU && !HERO) {     // a scanned machine shown as its model with added parts: hide its own points under it
+    const r = [...groups.values()].find((g) => g.el.provenance === 'scanned' && elementMeshes(g.el) && (g.el.boxes ?? []).some((b) => b.part));
+    cloudU.uHide.value = cloudView && r ? labelIndexOf(r.el.id) : 0;
+  }
+  if (cloudU) { cloudU.uSize.value = pointSize() * (cloudView ? 1 : 0.8); cloudU.uMinPx.value = pts && cloudView ? 2.2 : 1.5; cloudU.uMaxPx.value = 64; cloudU.uRound.value = 1; cloudU.uLo.value = 0; }
+  overlay.visible = (!cloudView || pts) && (stage === 'design' || stage === 'deliver');
+  $('#labels').style.visibility = cloudView && !pts ? 'hidden' : '';
   const dt = Math.min(200, now() - (applyViewLayers.t ?? now())); applyViewLayers.t = now();
   focus.w += (focus.goal - focus.w) * (1 - Math.exp(-dt / 450));
   updateEgress(now());
@@ -1277,11 +1796,12 @@ function applyViewLayers(st) {   // cloud / blend / model
 
 const v3 = new THREE.Vector3();
 function tick(t) {
-  requestAnimationFrame(tick);
   animateStage(t);
   if (stage === 'design') stepDesign(t);
   agentIndicator();
-  if (stage !== 'capture') { updateCamera(t); renderer.render(scene, camera); doHover(t); }
+  if (toastT && t > toastT) { toastT = 0; $('#toast').className = 'toast'; }
+  if (stage === 'cloud') { if (meta && cloud) renderRecon(t); }
+  else if (stage !== 'capture') { updateCamera(t); renderer.render(scene, camera); doHover(t); }
   layoutObjectLabels(t);
   if (stage === 'design' || stage === 'deliver') for (const l of labels) {
     v3.copy(l.v).project(camera); l.d.style.left = ((v3.x + 1) / 2 * W) + 'px'; l.d.style.top = ((1 - v3.y) / 2 * H) + 'px';
@@ -1291,7 +1811,7 @@ function tick(t) {
 
 // ---------------------------------------------------------------- capture-stage thumbnails (real frames from the video)
 async function grabThumbs() {
-  const v = document.createElement('video'); v.src = '/data/site.mp4'; v.muted = true; v.preload = 'auto';
+  const v = document.createElement('video'); v.src = video.currentSrc || dataURL('/data/site.mp4'); v.muted = true; v.preload = 'auto';
   await new Promise((r) => { v.addEventListener('loadeddata', r, { once: true }); v.addEventListener('error', r, { once: true }); setTimeout(r, 6000); });
   if (!v.videoWidth) return;
   const c = document.createElement('canvas'); c.width = 424; c.height = 200; const g = c.getContext('2d');
@@ -1314,25 +1834,15 @@ $$('#stage-nav a').forEach((a) => (a.onclick = (e) => { e.preventDefault(); setS
 $('.wordmark').onclick = (e) => { e.preventDefault(); setStage('capture'); };
 for (const id of ['#btn-replay', '#btn-replay2', '#btn-replay3']) $(id).onclick = () => startReplay();
 $('#btn-skip').onclick = skipReplay;
-$('#brief').onsubmit = (ev) => { ev.preventDefault(); startReplay(); };   // presenter build: Send plays the recorded run, never a live agent
+$('#brief').onsubmit = (ev) => { ev.preventDefault(); if (LIVE) sendMessage($('#brief-text').value, SEL, 'brief'); else startReplay(); };
 $('#btn-recloud').onclick = () => setStage('cloud');
 $('#btn-rebim').onclick = () => setStage('bim');
 $('#btn-export').onclick = doExport;
-$('#hint-cmd').textContent = AGENT_CMD;
+$('#hint-cmd').textContent = `Opus 5.5 over the MCP server · ${location.origin}/mcp`;
 $('#btn-copy').onclick = () => navigator.clipboard?.writeText(AGENT_CMD).then(() => toast('Command copied'), () => toast('Copy failed: select the command', true));
-$('#btn-reset').onclick = () => { $('#modal').hidden = false; $('#modal-yes').focus(); };
-$('#modal-no').onclick = () => ($('#modal').hidden = true);
-$('#modal-yes').onclick = async () => {
-  const b = $('#modal-yes'); b.disabled = true; b.textContent = 'Refitting the as-built model…';
-  try {
-    D.loading = true;
-    await selfWrite(() => mcp('fit_bim', { reset_design: true }));
-    D.mode = 'idle'; D.queue = []; D.model = null; D.src = null; D.liveShown = S.history.length; D.histSig = histSig(S); D.answered = {};
-    agent.briefAt = 0; agent.sentText = null; closeHero(); setSelection([]);
-    $$('#scen .scen').forEach((x) => x.classList.remove('on'));
-    $('#modal').hidden = true; toast('Reset to the as-built model'); setStage('design');
-  } catch (ex) { toast('Reset failed: ' + ex.message, true); }
-  finally { D.loading = false; b.disabled = false; b.textContent = 'Reset to as-built'; }
+$('#btn-reset').onclick = () => {     // local playback reset: nothing on the server changes
+  D.mode = 'idle'; D.queue = []; D.model = null; D.src = null; D.anim = null; D.settled = true; closeHero(); setSelection([]);
+  toast('Reset to the as-built model'); setStage(stage === 'design' ? 'design' : stage);
 };
 addEventListener('keydown', (e) => {
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || !$('#modal').hidden) { if (e.key === 'Escape') $('#modal').hidden = true; return; }
@@ -1343,15 +1853,63 @@ addEventListener('keydown', (e) => {
 addEventListener('hashchange', () => { const h = location.hash.slice(1); if (STAGES.includes(h) && h !== stage) setStage(h, { push: false }); });
 video.addEventListener('loadedmetadata', () => stage === 'capture' && renderCaptureFacts());
 
+// ---------------------------------------------------------------- capture hooks (scripts/record_live.py)
+const animStart = new WeakMap();
+function syncCssAnimations() {   // CSS transitions/keyframes follow the virtual clock
+  for (const a of document.getAnimations()) {
+    let st = animStart.get(a); if (st == null) { st = vnow; animStart.set(a, st); a.pause(); }
+    a.currentTime = vnow - st;
+  }
+}
+const seekVideo = (t) => new Promise((res) => {
+  if (Math.abs(video.currentTime - t) < 0.004) return res();
+  const done = () => { video.removeEventListener('seeked', done); clearTimeout(to); res(); };
+  const to = setTimeout(done, 3000);
+  video.addEventListener('seeked', done); video.currentTime = t;
+});
+const cursor = { x: 960, y: 560, fx: 960, fy: 560, tx: 960, ty: 560, t0: 0, ms: 1 };
+function status() { return { tag: $('#vp-tag')?.textContent, caption: $('#vp-caption span')?.textContent, stage, t: now() - stageAt, queue: D.queue.length, mode: D.mode, settled: D.settled, hero: HERO, sel: SEL.slice(), objects: OBJ.list.length, points: POINTS(), videoT: stage === 'cloud' ? videoT() : null, question: !!S?.questions?.find((q) => q.answer == null) }; }
+window.__demo = {
+  capture: CAPTURE, status,
+  go: (s2) => { setStage(s2); return status(); },
+  async frame(ms) {             // advance the virtual clock, line the <video> up with it, render, settle CSS
+    vnow = ms;
+    if (stage === 'capture') await seekVideo(((vnow - stageAt) / 1000) % vdur());
+    else if (stage === 'cloud') await seekVideo(Math.min(vdur() - 0.04, videoT()));
+    tick(vnow);
+    const c = cursor, k = ease((vnow - c.t0) / c.ms);
+    c.x = c.fx + (c.tx - c.fx) * k; c.y = c.fy + (c.ty - c.fy) * k;
+    $('#cursor').style.left = c.x + 'px'; $('#cursor').style.top = c.y + 'px';
+    syncCssAnimations();
+    return status();
+  },
+  cursor(x, y, ms = 800, show = true) { Object.assign(cursor, { fx: cursor.x, fy: cursor.y, tx: x, ty: y, t0: vnow, ms: Math.max(1, ms) }); $('#cursor').style.display = show ? 'block' : 'none'; },
+  click() { const c = $('#cursor'); c.classList.remove('click'); void c.offsetWidth; c.classList.add('click'); },
+  speed: (x) => recSpeed(x),
+  objects() {                   // on-screen anchors of the floating labels (for scripted hovers)
+    const r = vp.getBoundingClientRect(), out = [];
+    for (const [id, L] of olabels) if (L.front && L.x > 40 && L.x < W - 40 && L.y > 60 && L.y < H - 60) {
+      const inf = infoOf(id); out.push({ id, label: inf?.label, hero: !!inf?.hero, x: r.left + L.x, y: r.top + L.y + 28, area: inf?.size ? inf.size[0] * inf.size[1] : 0 });
+    }
+    return out;
+  },
+  project(id) { const e = heroEl(id) ?? groups.get(id)?.el; if (!e) return null; const b = elementBox(e); const c = b.getCenter(new THREE.Vector3()); c.z = b.max.z * 0.5; c.project(camera); const r = vp.getBoundingClientRect(); return [r.left + (c.x + 1) / 2 * W, r.top + (1 - c.y) / 2 * H]; },
+  select: (ids) => setSelection(ids), openHero: (id) => openHero(id), flyTo: (id) => flyTo(id), view: (v) => setView(v), poll: () => poll(true).then(status),
+  rect: (sel) => { const e = document.querySelector(sel); if (!e) return null; const b = e.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; },
+};
+
 // ---------------------------------------------------------------- boot
 setStage(STAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'capture', { push: false });
-await Promise.all([loadCloud().then(loadObjects), poll(true)]);
-if (!hasDesign(S)) getRecorded().catch(() => {});
+if (LIVE) await liveBoot();
+else {
+  await Promise.all([loadCloud().then(loadObjects), getRecorded().then((r) => { S = r; D.liveShown = S.history.length; })]);
+  const n = recModelName(); for (const id of ['#rec-tag', '#rec-tag2']) if ($(id)) $(id).textContent = 'Recorded run' + (n ? ' · ' + n : '');
+}
 $('#loading').classList.add('off');
 resize();
 setStage(stage, { push: false });
-setInterval(poll, 700);
-requestAnimationFrame(tick);
-grabThumbs();
-window.__live = { project: (id, dz = 1) => { const r = groups.get(id); if (!r) return null; const b = elementBox(r.el); const c = b.getCenter(new THREE.Vector3()); c.z = b.max.z * 0.6; c.project(camera); const rr = vp.getBoundingClientRect(); return [rr.left + (c.x + 1) / 2 * W, rr.top + (1 - c.y) / 2 * H]; },
+if (CAPTURE) { video.pause(); window.__demo.ready = true; }
+else { const loop = (t) => { requestAnimationFrame(loop); tick(t); }; requestAnimationFrame(loop); }
+if (!LIVE) { grabThumbs(); setTimeout(watchScan, 20000); }
+window.__live = { hero, cu: () => cloudU && { hover: cloudU.uHover.value, dim: cloudU.uDim.value, seg: cloudU.uSeg.value, view: VIEW, HOVER }, project: (id) => window.__demo.project(id),
   heroBox: () => { const r = groups.get(HERO); return r && new THREE.Box3().setFromObject(r.group); }, groups, OBJ, S: () => S, setSelection, openHero, setView, pick: (x, y) => pick(x, y), stage: () => stage, D, MOVE };   // test hook

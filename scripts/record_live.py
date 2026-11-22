@@ -1,4 +1,4 @@
-"""Record the recorded-run demo page (web/live/next/index.html) frame by frame at 1920x1080 / 30 fps, one clip per beat.
+"""Record the recorded-run demo page (web/live/index.html) frame by frame at 1920x1080 / 30 fps, one clip per beat.
 
     python scripts/record_live.py OUT_DIR [BASE_URL] [--beats capture,reconstruct,understand,click,hero_lathe,design,replan,model_edit]
 
@@ -37,7 +37,7 @@ def parse():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("out")
     ap.add_argument("base", nargs="?", default="http://127.0.0.1:8642")
-    ap.add_argument("--page", default="/web/live/next/index.html")
+    ap.add_argument("--page", default="/web/live/index.html")
     ap.add_argument("--beats", default=",".join(BEATS))
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--size", default="1920x1080")

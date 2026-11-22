@@ -26,9 +26,9 @@
       <a href="#deliver" data-s="deliver">Deliver</a>
     </nav>
     <div class="mast-actions">
-      <span id="agent-state" class="agent-state" hidden style="display:none" title="Inferred from changes in the project state"><i></i><span>Agent idle</span></span>
-      <button id="btn-replay" class="button secondary" title="Replay the recorded agent session">Replay session</button>
-      <button id="btn-reset" class="button secondary" title="Discard the design and refit the as-built model">Reset</button>
+      <span id="agent-state" class="agent-state" title="Inferred from changes in the project state"><i></i><span>Agent idle</span></span>
+      <button id="btn-replay" class="button secondary" title="Play the recorded design run">Replay run</button>
+      <button id="btn-reset" class="button secondary" title="Back to the as-built model (local playback only)">Reset</button>
     </div>
   </header>
 
@@ -41,6 +41,15 @@
     <div class="bench">
       <section id="viewport" class="viewport" aria-label="Stage view">
         <canvas id="gl"></canvas>
+        <div id="pane-video" class="pane"><span>Phone video</span></div>
+        <div id="pane-fpv" class="pane"><span>Point cloud · same moment, first person</span></div>
+        <div id="pane-top" class="pane"><span>Top down · as it is reconstructed</span></div>
+        <div id="recbar" class="recbar">
+          <button id="rec-play" class="button primary small">Pause</button>
+          <input id="rec-scrub" type="range" min="0" max="1" step="0.0005" value="0" aria-label="Scrub the video">
+          <span id="rec-time" class="mono-label">0:00</span>
+          <span id="rec-speed" class="rec-speed"><button data-x="1">1×</button><button data-x="2" aria-pressed="true">2×</button><button data-x="4">4×</button></span>
+        </div>
         <video id="video" src="/data/site.mp4" muted playsinline loop preload="auto"></video>
         <div id="labels"></div>
         <div id="olabels"></div>
@@ -54,7 +63,7 @@
         <div id="vp-caption" class="vp-caption"><b id="vp-tag"></b><span></span></div>
         <div id="pills" class="pills">
           <span class="pill" id="p-code"><i></i>Code</span><span class="pill" id="p-safety"><i></i>Safety</span>
-          <span class="pill" id="p-physics"><i></i>Physics</span><span class="pill" id="p-wishes"><i></i>Wishes</span>
+          <span class="pill" id="p-physics"><i></i>Physics</span><span class="pill" id="p-wishes"><i></i>Wishes</span><span class="pill" id="p-review" hidden title="Independent review by a second model (validation.review)"><i></i>Review</span>
         </div>
         <div id="wipe" class="wipe"><span class="wl">Scan</span><button id="wipe-knob" aria-label="Drag to compare scan and model">⟷</button><span class="wr">Model</span></div>
         <div id="vp-note" class="vp-note"></div>
@@ -100,6 +109,7 @@
           <h3 id="hero-title"></h3>
           <p id="hero-fn" class="fine"></p>
           <div id="hero-meta" class="hero-meta"></div>
+          <div class="stills"></div>
           <div class="mono-label">Parts</div>
           <ul id="hero-parts" class="hero-parts"></ul>
           <form id="hero-form" class="brief">
@@ -111,48 +121,39 @@
         <!-- 05 design -->
         <div class="panel panel-design" data-for="design">
           <form id="brief" class="brief">
-            <label for="brief-text" class="mono-label">Request · click objects to reference them</label>
+            <label for="brief-text" class="mono-label">Brief to the agent</label>
             <div id="mentions" class="mentions"></div>
-            <textarea id="brief-text" rows="3">Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.</textarea>
+            <textarea id="brief-text" rows="3" readonly>Add a CNC machining cell with a robot loader in the empty west bay, plus a tool rack. Keep a forklift aisle to the entrance.</textarea>
             <div id="suggest" class="suggest"></div>
             <div class="brief-actions">
-              <button class="button primary big" id="btn-send" type="submit">Send to agent →</button>
+              <button class="button primary big" id="btn-send" type="submit">Run design →</button><span class="rec-tag" id="rec-tag">Recorded run</span>
               <button class="button secondary" id="btn-replay2" type="button">Replay recorded</button>
             </div>
           </form>
+          <div id="followups" class="followups" hidden><span class="mono-label">Next requests · recorded</span><div class="fu-row"></div></div>
           <div id="hint" class="hint-card" hidden>
-            <b>No agent activity yet.</b> Start the agent in a terminal:
-            <code id="hint-cmd">source .venv/bin/activate &amp;&amp; python scripts/agent_gemini.py --watch --route auto</code>
-            <span class="hint-actions"><button class="button secondary small" id="btn-copy" type="button">Copy command</button><button class="button secondary small" id="btn-replay3" type="button">Replay recorded instead</button></span>
+            <b>No agent is connected.</b> The design step needs Opus 5.5 connected to this server over MCP:
+            <code id="hint-cmd">Opus 5.5 over the MCP server</code>
+            <span class="hint-actions"><button class="button secondary small" id="btn-copy" type="button">Copy MCP URL</button><button class="button secondary small" id="btn-replay3" type="button">Replay recorded instead</button></span>
           </div>
           <div id="scen-wrap" class="scen-wrap" hidden>
             <span class="mono-label">Pre-generated scenarios · instant, then replayed</span>
             <div id="scen" class="scen-row"></div>
           </div>
-          <div class="tiers" title="Gemini model tiers, routed by task difficulty (agent_gemini.py --route auto)">
-            <span class="mono-label">Gemini tiers · intelligence by task difficulty</span>
-            <div class="tier-row">
-              <span class="tier"><b>Carbon</b><small>plan · fix</small></span>
-              <span class="tier"><b>Neon</b><small>edit</small></span>
-              <span class="tier"><b>Argon</b><small>sign-off</small></span>
-              <span class="tier"><b>Hydrogen</b><small>read · wrap up</small></span>
-            </div>
-          </div>
           <div class="feed-head"><span class="mono-label">Agent activity</span><span id="feed-src" class="mono-label dim"></span><button id="btn-skip" class="link-btn" hidden>Skip to end ▸▸</button></div>
           <ol id="feed" class="feed"></ol>
         </div>
-        <!-- 06 deliver -->
+        <!-- 06 deliver: what the recorded run really produced -->
         <div class="panel panel-deliver" data-for="deliver">
           <div class="checks" id="dl-checks"></div>
-          <div class="dl-export">
-            <button class="button primary big" id="btn-export">Export IFC package</button>
-            <span id="export-status" class="fine"></span>
-          </div>
-          <ul id="files" class="files"></ul>
-          <div class="mono-label">Next steps</div>
-          <ol id="next" class="next"></ol>
-          <div class="mono-label">Quantities · proposed work</div>
-          <div id="qty" class="qty"></div>
+          <div class="mono-label">Client requirements</div>
+          <ul id="dl-reqs" class="dl-list"></ul>
+          <div class="mono-label">Site actions before installation</div>
+          <ul id="dl-warn" class="dl-list"></ul>
+          <div class="mono-label">Added by the agent</div>
+          <ul id="dl-added" class="dl-list"></ul>
+          <p class="fine" id="rec-tag2">Recorded run</p>
+          <div hidden><ol id="next"></ol><div id="qty"></div><ul id="files"></ul><span id="export-status"></span><button id="btn-export"></button><div id="review"></div></div>
         </div>
       </aside>
     </div>
@@ -175,6 +176,7 @@
     </div>
   </div>
   <div id="toast" class="toast" role="status"></div>
+  <div id="cursor"><svg width="22" height="22" viewBox="0 0 22 22"><path d="M2 1.5 L2 18 L6.6 13.8 L9.6 20.5 L12.6 19.2 L9.7 12.6 L16 12.4 Z" fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg></div>
 
   <script type="importmap">{ "imports": { "three": "/web/vendor/three.module.js" } }</script>
   <script type="module" src="live.js"></script>
