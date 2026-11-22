@@ -143,5 +143,10 @@ third_party/     lingbot-map (git clone)     models/  lingbot-map checkpoint
   that touch are sometimes merged into one box). Where plant hides the walls, the perimeter is closed as a
   rectangle and each side reports how much of it the scan actually supports (`scan_coverage`). A ceiling the
   camera never saw is reported as "not observed".
+- **Hero 3D model.** The textured Haas SL-30 model (`data/scan/objects.glb`, `capture_studio/hero.py`) has a
+  shape *generated* by Tencent Hunyuan3D-2 from one video crop, posed onto the scan by silhouette fitting, and
+  textured from the real video frames. Faces the video never saw are generated geometry with a flat paint fill.
+  Hunyuan3D-2 is under the Tencent Hunyuan 3D 2.0 Community License, which **does not apply in the EU, the UK
+  or South Korea** and carries attribution and acceptable-use terms; check it before redistributing.
 - **Demo video.** `data/site.mp4` is a third-party YouTube site walkthrough used for demonstration only;
   it is not ours and is not licensed for redistribution.

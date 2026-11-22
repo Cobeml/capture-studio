@@ -30,7 +30,7 @@ from . import fit, objects, store
 ROOT = store.ROOT
 HY3D_REPO = ROOT / "third_party" / "hunyuan3d-2"
 HY3D_MODELS = ROOT / "models" / "hy3dgen"
-MESH_SOURCE = "image-to-3d:tencent/Hunyuan3D-2 (hunyuan3d-dit-v2-0) + texture projected from the scan video"
+MESH_SOURCE = "image-to-3d:hunyuan3d-2 + video texture"
 LICENSE_NOTE = ("Shape generated with Tencent Hunyuan3D-2 (Tencent Hunyuan 3D 2.0 Community License; "
                 "territory excludes EU, UK, South Korea). Texture: projected from the walkthrough video.")
 
@@ -238,7 +238,7 @@ def bake_texture(V, F, UV, frames, cams, view_ids, masks_hr, size=2048):
     best_c = np.zeros((len(idx), 3))
     for f in view_ids:
         K, R, t = cams[f]
-        C = -R.T @ t
+        C = -np.linalg.solve(R, t)
         xc = X @ R.T + t
         zc = xc[:, 2]
         u = K[0, 0] * xc[:, 0] / zc + K[0, 2]
@@ -270,10 +270,26 @@ def bake_texture(V, F, UV, frames, cams, view_ids, masks_hr, size=2048):
     # crisp but seam-free: lean on the best view, blend in the weighted mean
     colour = np.where(seen[:, None], 0.65 * best_c + 0.35 * acc / np.maximum(wsum, 1e-9)[:, None], 0)
     if (~seen).any() and seen.any():
+        # faces no frame saw get the machine's own dominant paint (the body above the plinth, the plinth
+        # below), feathered into the nearest seen colour over a few cm: no streaks, no borrowed neighbours
         from scipy.spatial import cKDTree
+        zmin = float(V[:, 2].min())
+        low = X[:, 2] < zmin + 0.30
+        lum = colour.mean(1)
+
+        def paint(sel_):
+            c = colour[seen & sel_]
+            if len(c) < 50:
+                c = colour[seen]
+            l = c.mean(1)
+            return np.median(c[l >= np.percentile(l, 40)], axis=0)
+        body, plinth = paint(~low), paint(low)
+        base = np.where(low[:, None], plinth, body)
         tree = cKDTree(X[seen])
-        _, j = tree.query(X[~seen], k=8)
-        colour[~seen] = np.median(colour[seen][j], axis=1)
+        dd, j = tree.query(X[~seen], k=8)
+        near = np.median(colour[seen][j], axis=1)
+        w = np.clip(1 - dd.mean(1) / 0.06, 0, 1)[:, None]
+        colour[~seen] = w * near + (1 - w) * base[~seen]
     tex = np.zeros((size * size, 3), np.uint8)
     tex[idx] = np.clip(colour, 0, 255).astype(np.uint8)
     tex = tex.reshape(size, size, 3)
@@ -289,51 +305,91 @@ def to_local(Vw, pos, yaw_deg):
     return (Vw - [pos[0], pos[1], 0.0]) @ _rz(yaw_deg)       # row-vector form of Rz(-yaw) @ (X - p)
 
 
-def export_glb(heroes: list[dict], path: Path):
-    """heroes: [{key, V_local (Z-up), F, UV, tex (BGR)}] -> one glTF binary, one node+mesh per hero, Y-up."""
-    import trimesh
-    from PIL import Image
-    scene = trimesh.Scene()
+def subdivide_uv(V, F, UV):
+    """One midpoint subdivision (x4 faces), interpolating positions and UVs (seams are already split)."""
+    E = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+    uniq, inv = np.unique(E, axis=0, return_inverse=True)
+    inv = inv.ravel()
+    n = len(V)
+    Vn = np.concatenate([V, (V[uniq[:, 0]] + V[uniq[:, 1]]) / 2])
+    UVn = np.concatenate([UV, (UV[uniq[:, 0]] + UV[uniq[:, 1]]) / 2])
+    m = len(F)
+    a, b, c = n + inv[:m], n + inv[m:2 * m], n + inv[2 * m:]
+    Fn = np.concatenate([np.stack([F[:, 0], a, c], 1), np.stack([a, F[:, 1], b], 1),
+                         np.stack([c, b, F[:, 2]], 1), np.stack([a, b, c], 1)])
+    return Vn, Fn, UVn
+
+
+def export_glb(heroes: list[dict], path: Path, vertex_colors=True):
+    """heroes: [{key, V_local (Z-up), F, UV, tex (BGR)}] -> one glTF binary, one node+mesh per hero, stored
+    glTF Y-up (model (x, y, z) -> glTF (x, z, -y)). Each primitive carries the embedded baseColor texture
+    (JPEG) AND, for viewers that only use vertex colours, the texture baked into COLOR_0 (sRGB bytes) on a
+    once-subdivided mesh so the colours keep the detail."""
+    import pygltflib as g
+    blob = bytearray()
+    views, accs, meshes, nodes, mats, texs, imgs = [], [], [], [], [], [], []
+
+    def add_view(data: bytes, target=None):
+        while len(blob) % 4:
+            blob.append(0)
+        views.append(g.BufferView(buffer=0, byteOffset=len(blob), byteLength=len(data), target=target))
+        blob.extend(data)
+        return len(views) - 1
+
+    def add_acc(arr, ctype, atype, target, normalized=False, minmax=False):
+        v = add_view(arr.tobytes(), target)
+        kw = {"min": arr.min(0).tolist(), "max": arr.max(0).tolist()} if minmax else {}
+        accs.append(g.Accessor(bufferView=v, componentType=ctype, count=len(arr), type=atype, normalized=normalized, **kw))
+        return len(accs) - 1
+
     for h in heroes:
-        V = h["V_local"]
-        Vg = np.stack([V[:, 0], V[:, 2], -V[:, 1]], 1)           # model Z-up -> glTF Y-up
-        mat = trimesh.visual.material.PBRMaterial(
-            name=h["key"], baseColorTexture=Image.fromarray(h["tex"][:, :, ::-1]), metallicFactor=0.15,
-            roughnessFactor=0.65, doubleSided=False)
-        vis = trimesh.visual.TextureVisuals(uv=np.c_[h["UV"][:, 0], 1 - h["UV"][:, 1]], material=mat)
-        m = trimesh.Trimesh(vertices=Vg, faces=h["F"], visual=vis, process=False)
-        scene.add_geometry(m, geom_name=h["key"], node_name=h["key"])
-    path.write_bytes(scene.export(file_type="glb"))
+        V, F, UV = h["V_local"], h["F"], h["UV"]
+        if vertex_colors:
+            V, F, UV = subdivide_uv(V, F, UV)
+        Vg = np.stack([V[:, 0], V[:, 2], -V[:, 1]], 1).astype(np.float32)
+        mo = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(Vg.astype(np.float64)), o3d.utility.Vector3iVector(F))
+        mo.compute_vertex_normals()
+        N = np.asarray(mo.vertex_normals).astype(np.float32)
+        S = h["tex"].shape[0]
+        attrs = {"POSITION": add_acc(Vg, g.FLOAT, g.VEC3, g.ARRAY_BUFFER, minmax=True),
+                 "NORMAL": add_acc(N, g.FLOAT, g.VEC3, g.ARRAY_BUFFER),
+                 "TEXCOORD_0": add_acc(UV.astype(np.float32), g.FLOAT, g.VEC2, g.ARRAY_BUFFER)}
+        if vertex_colors:
+            rgb = _bilinear(h["tex"][:, :, ::-1], UV[:, 0] * (S - 1), UV[:, 1] * (S - 1))
+            col = np.concatenate([np.clip(np.round(rgb), 0, 255), np.full((len(rgb), 1), 255)], 1).astype(np.uint8)
+            attrs["COLOR_0"] = add_acc(col, g.UNSIGNED_BYTE, g.VEC4, g.ARRAY_BUFFER, normalized=True)
+        ind = add_acc(F.astype(np.uint32).ravel(), g.UNSIGNED_INT, g.SCALAR, g.ELEMENT_ARRAY_BUFFER)
+        jpg = cv2.imencode(".jpg", h["tex"], [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+        imgs.append(g.Image(bufferView=add_view(jpg), mimeType="image/jpeg", name=h["key"]))
+        texs.append(g.Texture(source=len(imgs) - 1, sampler=0))
+        mats.append(g.Material(name=h["key"], pbrMetallicRoughness=g.PbrMetallicRoughness(
+            baseColorTexture=g.TextureInfo(index=len(texs) - 1), metallicFactor=0.1, roughnessFactor=0.7)))
+        meshes.append(g.Mesh(name=h["key"], primitives=[g.Primitive(attributes=g.Attributes(**attrs), indices=ind,
+                                                                     material=len(mats) - 1)]))
+        nodes.append(g.Node(name=h["key"], mesh=len(meshes) - 1))
+    gl = g.GLTF2(asset=g.Asset(version="2.0", generator="capture_studio.hero"), scene=0,
+                 scenes=[g.Scene(nodes=list(range(len(nodes))))], nodes=nodes, meshes=meshes, materials=mats,
+                 textures=texs, images=imgs, samplers=[g.Sampler(magFilter=9729, minFilter=9987, wrapS=33071, wrapT=33071)],
+                 accessors=accs, bufferViews=views, buffers=[g.Buffer(byteLength=len(blob))])
+    gl.set_binary_blob(bytes(blob))
+    gl.save_binary(str(path))
 
 
 def render_mesh(V, F, UV, tex, eye, target, W=900, H=700, fov=40, bg=(32, 32, 36)):
-    """Ray-cast render of the textured mesh with simple lighting (for previews / turntables)."""
-    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F))
-    mesh.compute_triangle_normals()
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
-    rays = o3d.t.geometry.RaycastingScene.create_rays_pinhole(
-        fov_deg=fov, center=list(map(float, target)), eye=list(map(float, eye)), up=[0, 0, 1], width_px=W, height_px=H)
-    ans = scene.cast_rays(rays)
-    hit = np.isfinite(ans["t_hit"].numpy())
-    pid = ans["primitive_ids"].numpy()
-    bc = ans["primitive_uvs"].numpy()
-    img = np.zeros((H, W, 3), np.float64)
-    img[:] = bg
-    f = F[pid[hit]]
-    b1, b2 = bc[hit][:, 0], bc[hit][:, 1]
-    uv = (1 - b1 - b2)[:, None] * UV[f[:, 0]] + b1[:, None] * UV[f[:, 1]] + b2[:, None] * UV[f[:, 2]]
-    S = tex.shape[0]
-    c = tex[np.clip((uv[:, 1] * (S - 1)).astype(int), 0, S - 1), np.clip((uv[:, 0] * (S - 1)).astype(int), 0, S - 1)]
-    n = np.asarray(mesh.triangle_normals)[pid[hit]]
-    rd = rays.numpy()[..., 3:][hit]
-    rd /= np.linalg.norm(rd, axis=1, keepdims=True)
-    n = np.where((np.einsum("ij,ij->i", n, rd) > 0)[:, None], -n, n)
-    light = np.array([0.4, -0.5, 0.75])
-    light /= np.linalg.norm(light)
-    shade = 0.62 + 0.38 * np.clip(n @ light, 0, 1)
-    img[hit] = c * shade[:, None]
-    return np.clip(img, 0, 255).astype(np.uint8)
+    """Textured preview render from a look-at camera (Z up)."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    f = target - eye
+    f /= np.linalg.norm(f)
+    r = np.cross(f, [0, 0, 1.0])
+    r /= np.linalg.norm(r)
+    u = np.cross(r, f)
+    R = np.stack([r, -u, f])
+    fy = H / 2 / math.tan(math.radians(fov) / 2)
+    K = np.array([[fy, 0, W / 2], [0, fy, H / 2], [0, 0, 1.0]])
+    bgimg = np.empty((H, W, 3))
+    bgimg[:] = bg
+    img, _ = render_from_camera(V, F, UV, tex, K, R, -R @ eye, W, H, bg=bgimg)
+    return img
 
 
 # ---------------------------------------------------------------- driver
@@ -416,7 +472,9 @@ def build(key: str, frame_idx: int, seed=1234, shape_file: str | None = None) ->
     print("  registration:", {k: round(v, 3) for k, v in reg.items()})
 
     # 3. texture from the real frames (masks: the object's SAM masks, upsampled and dilated)
-    sel = sorted(by_area[:24])
+    amax = max(a for (_, _, _, a) in views)
+    area_of = {(f, j): a for (f, j, _, a) in views}
+    sel = sorted([v for v in by_area if area_of[v] >= 0.3 * amax][:24])
     masks_hr = {f: cv2.dilate(cv2.resize(lowmask[f].astype(np.uint8), (frames.shape[2], frames.shape[1]),
                                          interpolation=cv2.INTER_NEAREST), np.ones((15, 15), np.uint8)).astype(bool)
                 for f, _ in sel}
@@ -461,11 +519,14 @@ def write_outputs(keys: list[str]):
     for o in doc["objects"]:
         h = next((h for h in heroes if h["key"] == o["key"]), None)
         o["mesh"], o["hero"] = (o["key"], True) if h else (None, False)
-        for f in ("mesh_source", "mesh_license", "hero_input_frame", "texture_frames", "registration", "model_size_m"):
+        for f in ("mesh_source", "mesh_license", "hero_input_frame", "texture_frames", "registration", "model_size_m",
+                  "vertex_colors", "silhouette_frames"):
             o.pop(f, None)
         if h:
             o.update({f: h["info"][f] for f in ("mesh_source", "mesh_license", "hero_input_frame", "texture_frames",
-                                                 "registration", "model_size_m")})
+                                                 "registration", "model_size_m") if f in h["info"]})
+            o["vertex_colors"] = "srgb"
+            o["mesh_source"] = MESH_SOURCE
     doc["glb"] = "objects.glb: hero objects only; one node+mesh per hero named by its key; object-local frame " \
                  "(origin at pos on the floor, +x along length at yaw_deg), glTF Y-up (model = (x, -z, y))"
     (sd / "objects.json").write_text(json.dumps(doc, indent=1))
@@ -497,9 +558,6 @@ def main():
             print(k, h["seconds"], h["info"]["registration"], "texture seen", h["info"]["texture_seen_fraction"])
     write_outputs(a.keys)
 
-
-if __name__ == "__main__":
-    main()
 
 
 def render_from_camera(V, F, UV, tex, K, R, t, W, H, bg=None):
@@ -578,3 +636,7 @@ def fit_silhouettes(V_yup, F, views, yaw0, Q, step=2):
                  options={"xtol": 1e-3, "ftol": 1e-4, "maxfev": 600})
     p = r.x if -r.fun > best[0] else np.array(best[1])
     return place(p), {"yaw_deg": float(p[0]), "scale": float(s0 * math.exp(p[1])), "silhouette_iou": float(max(-r.fun, best[0]))}
+
+
+if __name__ == "__main__":
+    main()
